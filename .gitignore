@@ -1,0 +1,16 @@
+# local data from running the app in development
+data/
+
+# generated installer (contains your household defaults)
+dist/
+
+# household defaults — copy deploy/deploy.env.example
+deploy/deploy.env
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+Thumbs.db

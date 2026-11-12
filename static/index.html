@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f4d3a">
+<title>Family Wish Lists</title>
+<link rel="manifest" href="/static/manifest.json" crossorigin="use-credentials">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11h16v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9Zm-1-4h18v4H3V7Zm9 0v14M12 7c-1.5-3-5-3.5-5-1.2C7 7 9.5 7 12 7Zm0 0c1.5-3 5-3.5 5-1.2C17 7 14.5 7 12 7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    <h1>Wish Lists</h1>
+  </div>
+  <div class="who">
+    <span id="me" class="chip"></span>
+    <button id="settingsBtn" class="icon-btn" hidden aria-label="Settings" title="Settings">
+      <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm7.4-2.3.1-1.2-.1-1.2 2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-2-1.2L14.6 3h-4l-.4 2.6c-.7.3-1.4.7-2 1.2l-2.4-1-2 3.4 2 1.6-.1 1.2.1 1.2-2 1.6 2 3.4 2.4-1c.6.5 1.3.9 2 1.2l.4 2.6h4l.4-2.6c.7-.3 1.4-.7 2-1.2l2.4 1 2-3.4-2-1.6Z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+    <a id="logout" class="icon-btn" href="/cdn-cgi/access/logout" hidden aria-label="Sign out" title="Sign out">
+      <svg viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M5 12h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </a>
+  </div>
+</header>
+
+<nav id="tabs" class="tabs" role="tablist"></nav>
+
+<main>
+  <div id="ownerNote" class="note" hidden>This is your list. Purchases are hidden from you so nothing gets spoiled.</div>
+  <div class="toolbar">
+    <div id="summary" class="summary"></div>
+    <div class="controls">
+      <label class="toggle"><input type="checkbox" id="showBought" checked> Show purchased</label>
+      <select id="sort" aria-label="Sort items">
+        <option value="manual">My order</option>
+        <option value="priority">Priority</option>
+        <option value="price-asc">Price: low to high</option>
+        <option value="price-desc">Price: high to low</option>
+        <option value="name">Name A–Z</option>
+        <option value="newest">Newest first</option>
+        <option value="where">Online, then in store</option>
+      </select>
+    </div>
+  </div>
+  <ul id="items" class="items"></ul>
+  <p id="empty" class="empty" hidden></p>
+</main>
+
+<button id="addBtn" class="fab" hidden>
+  <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+  Add item
+</button>
+
+<!-- Add / edit item -->
+<dialog id="itemDlg">
+  <form id="itemForm" method="dialog">
+    <h2 id="itemDlgTitle">Add item</h2>
+    <div class="seg" role="radiogroup" aria-label="Where to buy">
+      <label><input type="radio" name="kind" value="online" checked><span>Online</span></label>
+      <label><input type="radio" name="kind" value="store"><span>In store</span></label>
+    </div>
+    <label>Item<input name="name" required maxlength="200" placeholder="e.g. LEGO Botanical Orchid"></label>
+    <label class="only-online">Link<input name="url" type="text" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="amazon.com/… or paste a link"></label>
+    <label class="only-store">Store<input name="store" maxlength="120" placeholder="e.g. Target, downtown" list="storeList"></label>
+    <datalist id="storeList"></datalist>
+    <div class="row">
+      <label>Price<input name="price" inputmode="decimal" placeholder="0.00"></label>
+      <label>Priority
+        <select name="priority">
+          <option value="1">★★★ Really wants</option>
+          <option value="2" selected>★★ Would like</option>
+          <option value="3">★ Nice to have</option>
+        </select>
+      </label>
+    </div>
+    <label>Notes<textarea name="notes" rows="2" maxlength="1000" placeholder="Size, color, model…"></textarea></label>
+    <div class="photo-field">
+      <span class="field-label">Photo</span>
+      <div class="photo-row">
+        <img id="photoPreview" class="photo-preview" alt="" hidden>
+        <button type="button" class="btn" id="photoPick">Add photo</button>
+        <button type="button" class="btn danger" id="photoRemove" hidden>Remove</button>
+        <input type="file" id="photoInput" accept="image/*" hidden>
+      </div>
+      <span class="muted small" id="photoHint">Take a picture or choose one. On a computer you can also paste or drop a screenshot here.</span>
+    </div>
+    <p class="form-error" id="itemErr"></p>
+    <div class="actions">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Mark purchased -->
+<dialog id="buyDlg">
+  <form id="buyForm" method="dialog">
+    <h2>Mark as purchased</h2>
+    <p id="buyWhat" class="muted"></p>
+    <label>Who got it?<input name="by" maxlength="80" required></label>
+    <p class="form-error" id="buyErr"></p>
+    <div class="actions">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary">Mark purchased</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Settings -->
+<dialog id="setDlg" class="wide">
+  <div class="set-body">
+    <h2>Settings</h2>
+    <section>
+      <h3>Lists</h3>
+      <p class="muted small">One tab per person. Tap a swatch to change that person's color. If you add the person's email, their own tab hides what's been bought.</p>
+      <ul id="peopleList" class="set-list"></ul>
+      <form id="addPersonForm" class="inline-form">
+        <input name="color" type="color" class="swatch" value="#1f4d3a" aria-label="Tab color" title="Tab color">
+        <input name="name" placeholder="Name" required maxlength="60">
+        <input name="owner_email" type="email" placeholder="Their email (optional)">
+        <button class="primary" type="submit">Add</button>
+      </form>
+    </section>
+    <section>
+      <h3>People who can sign in</h3>
+      <p class="muted small">Cloudflare Access decides who can open the site. Here you set how they appear and whether they can edit. Anyone not listed can view and check items off.</p>
+      <ul id="memberList" class="set-list"></ul>
+      <form id="addMemberForm" class="inline-form">
+        <input name="email" type="email" placeholder="Email" required>
+        <input name="display_name" placeholder="Shown as (e.g. Grandma)" required maxlength="60">
+        <select name="role"><option value="shopper">Can check off</option><option value="editor">Can edit</option></select>
+        <button class="primary" type="submit">Save</button>
+      </form>
+    </section>
+    <p class="form-error" id="setErr"></p>
+    <div class="actions"><button type="button" class="primary" data-close>Done</button></div>
+  </div>
+</dialog>
+
+<!-- Full-size photo -->
+<dialog id="photoDlg" class="photo-dlg" aria-label="Photo">
+  <img id="photoBig" alt="">
+  <p id="photoCap"></p>
+</dialog>
+
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

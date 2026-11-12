@@ -1,0 +1,4 @@
+# Keep LF everywhere: the installer and init script run on Alpine and break with CRLF.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
