@@ -2,7 +2,7 @@
 
 const $ = (s, el = document) => el.querySelector(s);
 const state = { me: null, people: [], current: null, items: [], person: null, editing: null, buying: null,
-  photo: { blob: null, remove: false, previewUrl: null } };
+  photo: { blob: null, remove: false, previewUrl: null }, loadedAt: 0, refreshing: false };
 
 const ICON = {
   link: '<svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
@@ -21,17 +21,47 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
 };
 
-async function api(path, opts = {}) {
-  const init = { method: opts.method || "GET", headers: { "X-Wishlist": "1" }, credentials: "same-origin" };
+const session = {
+  get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); return true; } catch { return false; } },
+  del(k) { try { sessionStorage.removeItem(k); } catch { /* storage unavailable */ } },
+};
+
+// The server never redirects API calls, so a redirect is Cloudflare Access sending an expired
+// session to its login page. 401s and the server's own "sign-in required" 403 mean the same.
+// A plain network error is not one of these: offline, a reload would only lose the list.
+const isAuthFailure = err => err.status === 0 || err.status === 401 ||
+  (err.status === 403 && /sign-in required/i.test(err.message));
+
+// Reload once so Access can show its login. The flag stops a loop when signing in doesn't
+// help; the next request that succeeds clears it.
+const RELOAD_FLAG = "wl.authReload";
+function reloadToSignIn() {
+  if (session.get(RELOAD_FLAG) || !session.set(RELOAD_FLAG, "1")) return false;
+  location.reload();
+  return true;
+}
+
+async function send(path, init, what = "Request") {
+  // Following Access's redirect fails as an opaque "Failed to fetch"; stopping at it lets us tell.
+  const r = await fetch(path, { ...init, credentials: "same-origin", redirect: "manual" });
+  let data = null;
+  try { data = await r.json(); } catch { /* non-JSON */ }
+  if (r.ok) { session.del(RELOAD_FLAG); return data; }
+  const err = new Error(r.type === "opaqueredirect" ? "Your sign-in has expired. Reload the page to sign in again."
+    : (data && data.error) || `${what} failed (${r.status})`);
+  err.status = r.status;
+  if (isAuthFailure(err) && reloadToSignIn()) return new Promise(() => {}); // the page is going away
+  throw err;
+}
+
+function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: { "X-Wishlist": "1" } };
   if (opts.body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(opts.body);
   }
-  const r = await fetch(path, init);
-  let data = null;
-  try { data = await r.json(); } catch { /* non-JSON */ }
-  if (!r.ok) throw new Error((data && data.error) || `Request failed (${r.status})`);
-  return data;
+  return send(path, init);
 }
 
 function toast(msg) {
@@ -87,6 +117,7 @@ async function boot() {
 
 async function loadPeople() {
   state.people = await api("/api/people");
+  state.loadedAt = Date.now();
   renderTabs();
 }
 
@@ -95,6 +126,7 @@ async function selectPerson(id) {
   store.set("wl.tab", String(id));
   renderTabs();
   const data = await api(`/api/people/${id}/items`);
+  if (state.current !== id) return; // another tab was picked while this one loaded
   state.person = data.person;
   state.items = data.items;
   renderItems();
@@ -105,6 +137,17 @@ async function refresh() {
   if (state.current && state.people.some(p => p.id === state.current)) await selectPerson(state.current);
   else if (state.people[0]) await selectPerson(state.people[0].id);
   else { state.person = null; state.items = []; renderItems(); }
+}
+
+// Installed on a phone, the app sits open for days. Catch up when it comes back to the front.
+const REFRESH_AFTER_MS = 30_000;
+const shouldRefresh = ({ visible, dialogOpen, busy, loadedAt, now }) =>
+  visible && !dialogOpen && !busy && loadedAt > 0 && now - loadedAt > REFRESH_AFTER_MS;
+
+async function backgroundRefresh() {
+  state.refreshing = true;
+  try { await refresh(); } catch { /* quietly keep what is on screen */ }
+  finally { state.refreshing = false; }
 }
 
 // ------------------------------------------------------------ rendering
@@ -338,13 +381,7 @@ async function takePhoto(file) {
 async function uploadPhoto(itemId, blob) {
   const fd = new FormData();
   fd.append("photo", blob, "photo.jpg");
-  const r = await fetch(`/api/items/${itemId}/photo`, {
-    method: "POST", headers: { "X-Wishlist": "1" }, credentials: "same-origin", body: fd,
-  });
-  let data = null;
-  try { data = await r.json(); } catch { /* non-JSON */ }
-  if (!r.ok) throw new Error((data && data.error) || `Upload failed (${r.status})`);
-  return data;
+  return send(`/api/items/${itemId}/photo`, { method: "POST", headers: { "X-Wishlist": "1" }, body: fd }, "Upload");
 }
 
 function imageFrom(dataTransfer) {
@@ -549,5 +586,9 @@ document.addEventListener("DOMContentLoaded", () => {
     } catch (err) { $("#setErr").textContent = err.message; }
   });
   document.querySelectorAll("dialog [data-close]").forEach(b => b.addEventListener("click", () => b.closest("dialog").close()));
+  document.addEventListener("visibilitychange", () => {
+    if (shouldRefresh({ visible: document.visibilityState === "visible", dialogOpen: !!$("dialog[open]"),
+                        busy: state.refreshing, loadedAt: state.loadedAt, now: Date.now() })) backgroundRefresh();
+  });
   boot();
 });
