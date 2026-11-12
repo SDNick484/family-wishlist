@@ -16,7 +16,9 @@ def node_major():
     return int(out.strip().lstrip("v").split(".")[0] or 0)
 
 
-@pytest.mark.skipif(node_major() < 20, reason="needs Node.js 20+ for the built-in test runner")
+# In CI (which sets CI=true) a missing Node is a broken setup, so fail instead of skipping.
+@pytest.mark.skipif(node_major() < 20 and not os.environ.get("CI"),
+                    reason="needs Node.js 20+ for the built-in test runner")
 def test_frontend_unit_tests():
     r = subprocess.run(["node", "--test", os.path.join(HERE, "frontend.test.mjs")],
                        capture_output=True, text=True, cwd=os.path.dirname(HERE))
