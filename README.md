@@ -58,6 +58,7 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
 | `CF_TEAM_DOMAIN` | Zero Trust team domain, e.g. `xxx.cloudflareaccess.com` (Settings → Team name and domain) |
 | `CF_AUD` | Access application's AUD tag (Access controls → Applications → app → Configure → Additional settings) |
 | `LAN_ROLE` | Role for direct LAN requests: `editor`, `shopper` or `none` |
+| `LAN_NAME` | Name shown for LAN users (default `Home`) |
 | `SEED_PEOPLE` | Tabs created on the very first start |
 | `PERSON_COLORS` | Default tab colors, `Name=#hex,Other|Alias=#hex`; only fills tabs without a color |
 
