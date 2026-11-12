@@ -7,9 +7,17 @@ import { test } from "node:test";
 import vm from "node:vm";
 
 const src = readFileSync(new URL("../static/app.js", import.meta.url), "utf8");
-const el = () => ({ hidden: false, textContent: "", innerHTML: "", value: "", addEventListener() {} });
+const el = () => ({ hidden: false, textContent: "", innerHTML: "", value: "", addEventListener() {}, querySelector: () => null });
+const session = new Map();
+const nav = { reloads: 0 };
 const ctx = vm.createContext({
   URL,
+  sessionStorage: {
+    getItem: k => session.get(k) ?? null,
+    setItem: (k, v) => session.set(k, String(v)),
+    removeItem: k => session.delete(k),
+  },
+  location: { reload() { nav.reloads++; } },
   document: {
     addEventListener() {},
     querySelector: el,
@@ -18,8 +26,8 @@ const ctx = vm.createContext({
   },
 });
 vm.runInContext(src, ctx, { filename: "app.js" });
-const { esc, money, host, inkFor, colorOf, SORTS, itemHTML, state } =
-  vm.runInContext("({ esc, money, host, inkFor, colorOf, SORTS, itemHTML, state })", ctx);
+const { esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure, shouldRefresh } =
+  vm.runInContext("({ esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure, shouldRefresh })", ctx);
 
 const item = (over = {}) => ({
   id: 1, person_id: 1, name: "Thing", kind: "online", url: null, store: null, price: null, priority: 2,
@@ -130,4 +138,103 @@ test("priority stars: 1 is three stars, 3 is one", () => {
   as("shopper");
   const stars = p => itemHTML(item({ priority: p }), false).match(/★+/)[0].length;
   assert.deepEqual([stars(1), stars(2), stars(3)], [3, 2, 1]);
+});
+
+// ------------------------------------------------------------ refresh and expired sessions
+const reply = (status, body, type = "basic") => ({
+  status, type, ok: status >= 200 && status < 300,
+  json: async () => { if (body === undefined) throw new SyntaxError("not JSON"); return body; },
+});
+const ACCESS_REDIRECT = reply(0, undefined, "opaqueredirect"); // what fetch sees when Access bounces to its login
+const serve = (...replies) => {
+  const seen = [];
+  ctx.fetch = async (path, init) => { seen.push(init); return replies.shift(); };
+  return seen;
+};
+const settled = p => Promise.race([p.then(() => "resolved", () => "rejected"), new Promise(r => setTimeout(r, 20, "pending"))]);
+const fresh = () => { session.clear(); nav.reloads = 0; };
+
+test("auth failures are a redirect from Access, a 401, or the server's sign-in 403", () => {
+  const fail = (status, message = "x") => Object.assign(new Error(message), { status });
+  assert.ok(isAuthFailure(fail(0)));
+  assert.ok(isAuthFailure(fail(401)));
+  assert.ok(isAuthFailure(fail(403, "Cloudflare Access sign-in required.")));
+  assert.ok(!isAuthFailure(fail(403, "Only editors can do that.")));
+  assert.ok(!isAuthFailure(fail(403, "That's your own list — no peeking!")));
+  assert.ok(!isAuthFailure(fail(400)));
+  // offline: a reload would only swap the list for the browser's error page
+  assert.ok(!isAuthFailure(new TypeError("Failed to fetch")));
+});
+
+test("refresh on return only when the list is stale, the page visible and nothing is open", () => {
+  const ok = { visible: true, dialogOpen: false, busy: false, loadedAt: 1_000_000, now: 1_031_000 };
+  assert.equal(shouldRefresh(ok), true);
+  assert.equal(shouldRefresh({ ...ok, now: ok.loadedAt + 5_000 }), false);
+  assert.equal(shouldRefresh({ ...ok, visible: false }), false);
+  assert.equal(shouldRefresh({ ...ok, dialogOpen: true }), false);
+  assert.equal(shouldRefresh({ ...ok, busy: true }), false);
+  assert.equal(shouldRefresh({ ...ok, loadedAt: 0 }), false); // still booting, or boot failed
+});
+
+test("requests don't follow redirects, so an Access login bounce is visible", async () => {
+  fresh();
+  const seen = serve(reply(200, { ok: true }));
+  await api("/api/me");
+  assert.equal(seen[0].redirect, "manual");
+});
+
+test("an expired session reloads the page once, then reports the error instead of looping", async () => {
+  fresh();
+  serve(ACCESS_REDIRECT, ACCESS_REDIRECT);
+  assert.equal(await settled(api("/api/people")), "pending"); // the page is going away: no toast, nothing cleared
+  assert.equal(nav.reloads, 1);
+  const again = api("/api/people");
+  assert.equal(await settled(again), "rejected");
+  await assert.rejects(again, e => e.status === 0 && /sign/i.test(e.message));
+  assert.equal(nav.reloads, 1);
+});
+
+test("a successful request re-arms the reload", async () => {
+  fresh();
+  serve(reply(403, { error: "Cloudflare Access sign-in required." }), reply(200, []),
+        reply(403, { error: "Cloudflare Access sign-in required." }));
+  api("/api/people");
+  await api("/api/people");
+  assert.equal(await settled(api("/api/people")), "pending");
+  assert.equal(nav.reloads, 2);
+});
+
+test("other errors are thrown with their message and never reload", async () => {
+  fresh();
+  serve(reply(403, { error: "Only editors can do that." }), reply(500, undefined));
+  await assert.rejects(api("/api/items/1", { method: "DELETE", body: {} }), { message: "Only editors can do that." });
+  await assert.rejects(api("/api/people"), { message: "Request failed (500)" });
+  assert.equal(nav.reloads, 0);
+});
+
+test("no reload when the guard can't be stored, so it can't loop", async () => {
+  fresh();
+  const { setItem } = ctx.sessionStorage;
+  ctx.sessionStorage.setItem = () => { throw new Error("blocked"); };
+  try {
+    serve(ACCESS_REDIRECT);
+    assert.equal(await settled(api("/api/people")), "rejected");
+    assert.equal(nav.reloads, 0);
+  } finally { ctx.sessionStorage.setItem = setItem; }
+});
+
+test("a slow response for a tab you've left doesn't replace the tab you're on", async () => {
+  fresh();
+  const pending = [];
+  ctx.fetch = () => new Promise(res => pending.push(res));
+  state.me = { role: "shopper", name: "Tester", source: "cloudflare" };
+  state.people = [{ id: 1, name: "Alex" }, { id: 2, name: "Sam" }];
+  const first = selectPerson(1), second = selectPerson(2);
+  await new Promise(r => setTimeout(r, 0));
+  pending[1](reply(200, { person: { id: 2, name: "Sam" }, items: [item({ name: "for Sam" })] }));
+  await second;
+  pending[0](reply(200, { person: { id: 1, name: "Alex" }, items: [item({ name: "for Alex" })] }));
+  await first;
+  assert.equal(state.person.name, "Sam");
+  assert.equal(names(state.items), "for Sam");
 });
