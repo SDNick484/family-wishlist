@@ -1,8 +1,10 @@
 # Family Wish Lists
 
 A small self-hosted wish list tracker for the family: one tab per person, online items (link + price)
-and in-store items (store + price), sorting, photos, and "who got it" tracking that is hidden from
-the person whose list it is. Runs on an Alpine LXC on Proxmox and is shared through a Cloudflare
+and in-store items (store + price), sorting, photos, occasion tags, and "who got it" tracking that is
+hidden from the person whose list it is. Shoppers can reserve an item before buying it and leave
+secret gift ideas on someone else's tab; once gifts are given, an editor archives them to a
+per-tab History that doubles as a thank-you list. Runs on an Alpine LXC on Proxmox and is shared through a Cloudflare
 Tunnel with Cloudflare Access (email one-time PIN) in front of it.
 
 - **Backend:** Flask + SQLite (`app.py`), served by gunicorn under OpenRC
@@ -69,9 +71,12 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
 2. The app verifies the `Cf-Access-Jwt-Assertion` JWT (signature via the team's JWKS, audience,
    issuer, expiry) and takes the email from it. A forged email header alone is never trusted.
 3. Roles: emails in `ADMIN_EMAILS` and members marked "Can edit" in Settings are **editors**
-   (add/edit/delete items, photos, tabs). Everyone else Access lets in is a **shopper** (view, mark purchased).
+   (add/edit/delete items, photos, tabs, archive). Everyone else Access lets in is a **shopper** (view,
+   reserve, mark purchased, add secret ideas and edit their own).
 4. **Spoiler protection:** give a tab an owner email in Settings → Lists. When that person opens their
-   own tab, purchase state, buyer names and bought counts are stripped server-side.
+   own tab, purchase and reservation state, buyer names and counts are stripped server-side, and secret
+   ideas don't exist for them. Archiving purchased items is the reveal: History shows the owner who gave
+   what. Secret ideas need a Cloudflare sign-in; LAN visitors can't see or add them.
 5. Mutating requests need the `X-Wishlist: 1` header plus a JSON (or photo multipart) body and a same-origin
    `Origin`, which blocks cross-site request forgery.
 

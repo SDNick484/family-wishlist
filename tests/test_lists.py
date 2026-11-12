@@ -121,6 +121,12 @@ class TestItemFields:
         ("post", "/api/items/1/move", [1]),
         ("post", "/api/items/1/purchase", {"by": 5}),
         ("post", "/api/items/1/purchase", [1]),
+        ("post", "/api/items/1/reserve", {"by": 5}),
+        ("post", "/api/items/1/reserve", [1]),
+        ("post", "/api/items/1/archive", [1]),
+        ("patch", "/api/items/1", {"occasion": 5}),
+        ("post", "/api/people/1/ideas", [1]),
+        ("post", "/api/people/1/ideas", {"name": "x", "kind": "online", "occasion": ["a"]}),
     ])
     def test_malformed_bodies_elsewhere_are_a_400(self, client, people, method, path, body):
         add(client, people["Alex"])
@@ -287,7 +293,8 @@ class TestPurchasesMore:
         add(client, owned, price=2.5)
         client.post(f"/api/items/{a}/purchase", GRANDMA)
         assert tab(client, owned, GRANDMA) | {"color": None} == {
-            "id": owned, "name": "Alex", "color": None, "is_me": False, "count": 3, "bought": 1, "remaining": 2.5}
+            "id": owned, "name": "Alex", "color": None, "is_me": False, "count": 3, "bought": 1, "reserved": 0,
+            "remaining": 2.5, "archived": 0}
         client.delete(f"/api/items/{a}", ALEX)  # owner removes the bought one
         t = tab(client, owned, GRANDMA)
         assert (t["count"], t["bought"], t["remaining"]) == (2, 0, 2.5)
@@ -299,12 +306,235 @@ class TestPurchasesMore:
         assert r["purchased"] is True and r["name"] == "Renamed"
 
 
+# ------------------------------------------------------------------ secret ideas
+def idea(client, pid, email=GRANDMA, **fields):
+    return client.post(f"/api/people/{pid}/ideas", email, json={"name": "Idea", "kind": "online", **fields})
+
+
+class TestSecretIdeas:
+    def test_shopper_adds_an_idea_everyone_else_sees_as_secret(self, client, people):
+        r = idea(client, people["Alex"], name="Drone", price=40)
+        assert r.status_code == 201
+        assert (r.json["secret"], r.json["my_idea"], r.json["created_by"]) == (True, True, "Grandma")
+        assert "created_by_email" not in r.json
+        theirs = items_of(client, people["Alex"], "uncle@example.com")[0]
+        assert (theirs["name"], theirs["secret"], theirs["my_idea"]) == ("Drone", True, False)
+        assert tab(client, people["Alex"], "uncle@example.com")["count"] == 1
+
+    def test_ideas_are_validated_like_items(self, client, people):
+        assert idea(client, people["Alex"], name=" ").status_code == 400
+        assert idea(client, people["Alex"], url="javascript:alert(1)").status_code == 400
+        assert client.post("/api/people/999/ideas", GRANDMA, json={"name": "x", "kind": "online"}).status_code == 404
+
+    def test_regular_items_still_need_an_editor(self, client, people):
+        r = client.post(f"/api/people/{people['Alex']}/items", GRANDMA, json={"name": "x", "kind": "online"})
+        assert r.status_code == 403
+
+    def test_author_or_editor_can_change_an_idea_and_nobody_else(self, client, people):
+        iid = idea(client, people["Alex"]).json["id"]
+        uncle = "uncle@example.com"
+        assert client.patch(f"/api/items/{iid}", uncle, json={"name": "Nope"}).status_code == 403
+        assert client.delete(f"/api/items/{iid}", uncle).status_code == 403
+        assert client.upload(iid, png(), email=uncle).status_code == 403
+        assert client.patch(f"/api/items/{iid}", GRANDMA, json={"name": "Better"}).json["name"] == "Better"
+        assert client.upload(iid, png(), email=GRANDMA).status_code == 200
+        assert client.delete(f"/api/items/{iid}/photo", GRANDMA).status_code == 200
+        assert client.patch(f"/api/items/{iid}", ADMIN, json={"notes": "ok"}).status_code == 200
+        assert client.delete(f"/api/items/{iid}", GRANDMA).json == {"ok": True}
+        assert items_of(client, people["Alex"]) == []
+
+    def test_authors_cannot_edit_regular_items_or_reorder(self, client, people):
+        iid = idea(client, people["Alex"]).json["id"]
+        regular = add(client, people["Alex"]).json["id"]
+        assert client.patch(f"/api/items/{regular}", GRANDMA, json={"name": "x"}).status_code == 403
+        assert client.post(f"/api/items/{iid}/move", GRANDMA, json={"dir": "up"}).status_code == 403
+
+    def test_ideas_can_be_purchased_like_any_item(self, client, people):
+        iid = idea(client, people["Alex"]).json["id"]
+        r = client.post(f"/api/items/{iid}/purchase", "uncle@example.com", json={"by": "Uncle"})
+        assert r.json["purchased_by"] == "Uncle" and r.json["secret"] is True
+
+
+# ------------------------------------------------------------------ reservations
+def reserve(client, iid, email=GRANDMA, **body):
+    return client.post(f"/api/items/{iid}/reserve", email, json=body)
+
+
+class TestReservations:
+    def test_reserve_shows_who_to_everyone_else(self, client, people):
+        iid = add(client, people["Alex"]).json["id"]
+        r = reserve(client, iid)
+        assert r.status_code == 200 and r.json["reserved_by"] == "Grandma" and r.json["reserved_mine"] is True
+        theirs = items_of(client, people["Alex"], "uncle@example.com")[0]
+        assert (theirs["reserved_by"], theirs["reserved_mine"], theirs["purchased"]) == ("Grandma", False, False)
+        assert theirs["reserved_at"] and "reserved_by_email" not in theirs
+        t = tab(client, people["Alex"], "uncle@example.com")
+        assert (t["count"], t["reserved"], t["bought"]) == (1, 1, 0)
+
+    def test_second_reservation_is_refused_naming_the_first(self, client, people):
+        iid = add(client, people["Alex"]).json["id"]
+        reserve(client, iid, by="Grandma G")
+        r = reserve(client, iid, "uncle@example.com")
+        assert r.status_code == 400 and "Grandma G" in r.json["error"]
+        assert reserve(client, iid).status_code == 400  # not even twice by the same person
+
+    def test_purchased_items_cannot_be_reserved(self, client, people):
+        iid = add(client, people["Alex"]).json["id"]
+        client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"by": "Grandma"})
+        r = reserve(client, iid, "uncle@example.com")
+        assert r.status_code == 400 and "purchased by Grandma" in r.json["error"]
+
+    def test_only_the_reserver_can_mark_it_purchased(self, client, people, monkeypatch):
+        iid = add(client, people["Alex"]).json["id"]
+        reserve(client, iid, by="Grandma")
+        for email in ("uncle@example.com", ADMIN):
+            r = client.post(f"/api/items/{iid}/purchase", email)
+            assert r.status_code == 400 and "Grandma" in r.json["error"]
+        r = client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"by": "Grandma"})
+        assert r.json["purchased"] is True and r.json["reserved_by"] is None
+        # undoing the purchase leaves it open, not reserved
+        r = client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"purchased": False})
+        assert r.json["purchased"] is False and r.json["reserved_by"] is None
+
+    def test_reservation_made_after_the_item_was_read_still_blocks_the_purchase(self, client, people, monkeypatch):
+        iid = add(client, people["Alex"]).json["id"]
+        real_get_item = wishlist.get_item
+
+        def stale_read(item_id):
+            row = real_get_item(item_id)
+            monkeypatch.setattr(wishlist, "get_item", real_get_item)
+            other = sqlite3.connect(wishlist.DB_PATH)
+            other.execute("UPDATE items SET reserved_by = 'Grandma', reserved_by_email = ?, reserved_at = 1 "
+                          "WHERE id = ?", (GRANDMA, item_id))
+            other.commit()
+            other.close()
+            return row
+
+        monkeypatch.setattr(wishlist, "get_item", stale_read)
+        r = client.post(f"/api/items/{iid}/purchase", "uncle@example.com")
+        assert r.status_code == 400 and "Grandma" in r.json["error"]
+        assert items_of(client, people["Alex"])[0]["purchased"] is False
+
+    def test_release_by_the_reserver_or_an_editor(self, client, people):
+        iid = add(client, people["Alex"]).json["id"]
+        reserve(client, iid)
+        r = reserve(client, iid, "uncle@example.com", reserved=False)
+        assert r.status_code == 403
+        r = reserve(client, iid, reserved=False)
+        assert r.status_code == 200 and r.json["reserved_by"] is None
+        reserve(client, iid, "uncle@example.com")
+        assert reserve(client, iid, ADMIN, reserved=False).json["reserved_by"] is None
+        assert reserve(client, iid).json["reserved_mine"] is True  # open again for anyone
+
+    def test_lan_reservation_uses_the_typed_name(self, client, people):
+        iid = add(client, people["Alex"]).json["id"]
+        h = {"X-Wishlist": "1"}
+        r = client.lan("post", f"/api/items/{iid}/reserve", json={"by": "Mom"}, headers=h)
+        assert r.json["reserved_by"] == "Mom" and r.json["reserved_mine"] is False
+        # a LAN purchase can't prove it is the reserver; the LAN editor releases first
+        assert client.lan("post", f"/api/items/{iid}/purchase", json={}, headers=h).status_code == 400
+        assert client.lan("post", f"/api/items/{iid}/reserve", json={"reserved": False}, headers=h).status_code == 200
+
+    def test_editing_keeps_the_reservation(self, client, people):
+        iid = add(client, people["Alex"]).json["id"]
+        reserve(client, iid)
+        assert client.patch(f"/api/items/{iid}", ADMIN, json={"name": "Renamed"}).json["reserved_by"] == "Grandma"
+
+
+# ------------------------------------------------------------------ occasions and archive
+def history(client, pid, email=ADMIN):
+    return client.get(f"/api/people/{pid}/history", email).json["items"]
+
+
+class TestOccasions:
+    def test_occasion_is_trimmed_capped_and_clearable(self, client, people):
+        iid = add(client, people["Alex"], occasion="  Christmas  ").json["id"]
+        assert items_of(client, people["Alex"])[0]["occasion"] == "Christmas"
+        assert client.patch(f"/api/items/{iid}", ADMIN, json={"occasion": "x" * 100}).json["occasion"] == "x" * 60
+        assert client.patch(f"/api/items/{iid}", ADMIN, json={"occasion": ""}).json["occasion"] is None
+        assert add(client, people["Alex"]).json["occasion"] is None
+
+    def test_suggestions_come_from_every_tab_most_used_first(self, client, people):
+        add(client, people["Alex"], occasion="Birthday")
+        add(client, people["Sam"], occasion="Christmas")
+        add(client, people["Jordan"], occasion="Christmas")
+        add(client, people["Jordan"], occasion="anniversary")
+        assert client.get("/api/occasions", GRANDMA).json == ["Christmas", "anniversary", "Birthday"]
+
+    def test_secret_idea_occasions_are_not_suggested_to_lan(self, client, people):
+        idea(client, people["Alex"], occasion="Surprise party")
+        assert client.get("/api/occasions", GRANDMA).json == ["Surprise party"]
+        assert client.lan("get", "/api/occasions").json == []
+
+
+class TestArchive:
+    @pytest.fixture
+    def given(self, client, people):
+        """Alex's tab: two purchased items and one still wanted."""
+        ids = {n: add(client, people["Alex"], name=n, price=10).json["id"] for n in ("Kite", "Yo-yo", "Bike")}
+        client.post(f"/api/items/{ids['Kite']}/purchase", GRANDMA, json={"by": "Grandma"})
+        client.post(f"/api/items/{ids['Yo-yo']}/purchase", "uncle@example.com", json={"by": "Uncle"})
+        return ids
+
+    def test_only_purchased_items_can_be_archived(self, client, people, given):
+        r = client.post(f"/api/items/{given['Bike']}/archive", ADMIN)
+        assert r.status_code == 400 and history(client, people["Alex"]) == []
+
+    def test_archived_items_leave_the_list_and_counts(self, client, people, given):
+        r = client.post(f"/api/items/{given['Kite']}/archive", ADMIN)
+        assert r.status_code == 200 and r.json["archived_at"]
+        assert [i["name"] for i in items_of(client, people["Alex"])] == ["Yo-yo", "Bike"]
+        t = tab(client, people["Alex"], GRANDMA)
+        assert (t["count"], t["bought"], t["archived"], t["remaining"]) == (2, 1, 1, 10)
+        assert [(i["name"], i["purchased_by"]) for i in history(client, people["Alex"], GRANDMA)] == [("Kite", "Grandma")]
+
+    def test_restore_puts_it_back_on_the_list(self, client, people, given):
+        client.post(f"/api/items/{given['Kite']}/archive", ADMIN)
+        r = client.post(f"/api/items/{given['Kite']}/archive", ADMIN, json={"archived": False})
+        assert r.json["archived_at"] is None and r.json["purchased"] is True
+        assert order(client, people["Alex"]) == ["Kite", "Yo-yo", "Bike"] and history(client, people["Alex"]) == []
+
+    def test_archive_everything_purchased_on_a_tab(self, client, people, given):
+        add(client, people["Sam"], name="Elsewhere")
+        sam_bought = add(client, people["Sam"]).json["id"]
+        client.post(f"/api/items/{sam_bought}/purchase", GRANDMA)
+        assert client.post(f"/api/people/{people['Alex']}/archive", ADMIN).json == {"archived": 2}
+        assert client.post(f"/api/people/{people['Alex']}/archive", ADMIN).json == {"archived": 0}
+        assert [i["name"] for i in items_of(client, people["Alex"])] == ["Bike"]
+        assert len(items_of(client, people["Sam"])) == 2  # other tabs untouched
+        assert client.post("/api/people/999/archive", ADMIN).status_code == 404
+
+    def test_history_is_newest_first(self, client, people, given, monkeypatch):
+        client.post(f"/api/items/{given['Kite']}/archive", ADMIN)
+        monkeypatch.setattr(wishlist.time, "time", lambda: 4_000_000_000)
+        client.post(f"/api/items/{given['Yo-yo']}/archive", ADMIN)
+        assert [i["name"] for i in history(client, people["Alex"])] == ["Yo-yo", "Kite"]
+
+    def test_shoppers_cannot_archive(self, client, people, given):
+        assert client.post(f"/api/items/{given['Kite']}/archive", GRANDMA).status_code == 403
+        assert client.post(f"/api/people/{people['Alex']}/archive", GRANDMA).status_code == 403
+
+    def test_archived_items_cannot_be_bought_reserved_undone_or_moved(self, client, people, given):
+        kite = given["Kite"]
+        client.post(f"/api/items/{kite}/archive", ADMIN)
+        for path, body in ((f"/api/items/{kite}/purchase", {"purchased": False}), (f"/api/items/{kite}/purchase", {}),
+                           (f"/api/items/{kite}/reserve", {}), (f"/api/items/{kite}/move", {"dir": "up"})):
+            assert client.post(path, ADMIN, json=body).status_code == 400, path
+        assert history(client, people["Alex"])[0]["purchased_by"] == "Grandma"
+
+    def test_archived_items_can_still_be_deleted(self, client, people, given):
+        client.post(f"/api/items/{given['Kite']}/archive", ADMIN)
+        assert client.delete(f"/api/items/{given['Kite']}", ADMIN).status_code == 200
+        assert history(client, people["Alex"]) == []
+
+
 # ------------------------------------------------------------------ spoilers
 class TestSpoilersMore:
     """The owner of a tab must not be able to learn what has been bought, from any endpoint."""
 
     HIDDEN = {"purchased": False, "purchased_by": None, "purchased_at": None, "mine": False,
-              "removed_by_owner": False}
+              "removed_by_owner": False, "secret": False, "my_idea": False, "reserved_by": None,
+              "reserved_at": None, "reserved_mine": False}
 
     @pytest.fixture
     def bought(self, client, owned):
@@ -382,6 +612,123 @@ class TestSpoilersMore:
         data = client.lan("get", f"/api/people/{owned}/items").json
         assert data["person"]["is_me"] is False
         assert any(i["purchased"] for i in data["items"])
+
+    def test_removed_item_answers_owner_like_a_missing_item(self, client, owned, bought):
+        # a second delete or a photo request must not tell "bought, so kept" from "really deleted"
+        client.upload(bought, png())
+        client.delete(f"/api/items/{bought}", ALEX)
+        for method, path, body in (("delete", "/api/items/{}", {}), ("patch", "/api/items/{}", {"notes": "x"}),
+                                   ("get", "/photos/{}/full", None)):
+            a = client.req(method, path.format(bought), ALEX, json=body)
+            b = client.req(method, path.format(99999), ALEX, json=body)
+            assert (a.status_code, a.get_data()) == (b.status_code, b.get_data()) and a.status_code == 404, path
+
+    # secret ideas
+    @pytest.fixture
+    def secret(self, client, owned):
+        r = idea(client, owned, name="Surprise drone", occasion="Hush birthday")
+        assert r.status_code == 201
+        return r.json["id"]
+
+    def test_owner_never_sees_secret_ideas(self, client, owned, secret):
+        add(client, owned, name="Wanted")
+        assert [i["name"] for i in items_of(client, owned, ALEX)] == ["Wanted"]
+        assert tab(client, owned, ALEX)["count"] == 1 and tab(client, owned, GRANDMA)["count"] == 2
+        for path in ("/api/people", f"/api/people/{owned}/items", f"/api/people/{owned}/history", "/api/occasions"):
+            body = client.get(path, ALEX).get_data(as_text=True)
+            assert "Surprise" not in body and "Hush" not in body, path
+
+    def test_secret_idea_answers_owner_like_a_missing_item(self, client, owned, secret):
+        client.upload(secret, png())
+        missing = 99999
+        for method, path, body in (
+                ("patch", "/api/items/{}", {"notes": "x"}), ("delete", "/api/items/{}", {}),
+                ("post", "/api/items/{}/move", {"dir": "up"}), ("post", "/api/items/{}/purchase", {}),
+                ("post", "/api/items/{}/purchase", {"purchased": False}), ("post", "/api/items/{}/reserve", {}),
+                ("post", "/api/items/{}/reserve", {"reserved": False}), ("post", "/api/items/{}/archive", {}),
+                ("delete", "/api/items/{}/photo", {}), ("get", "/photos/{}/full", None),
+                ("get", "/photos/{}/thumb", None)):
+            a = client.req(method, path.format(secret), ALEX, json=body)
+            b = client.req(method, path.format(missing), ALEX, json=body)
+            assert (a.status_code, a.get_data()) == (b.status_code, b.get_data()), (method, path)
+        a, b = client.upload(secret, png(), email=ALEX), client.upload(missing, png(), email=ALEX)
+        assert (a.status_code, a.json) == (b.status_code, b.json) == (404, {"error": "No such item."})
+        kept = items_of(client, owned, GRANDMA)[0]
+        assert (kept["id"], kept["notes"], kept["purchased"]) == (secret, None, False)
+
+    def test_owner_cannot_add_ideas_to_their_own_tab(self, client, owned):
+        assert idea(client, owned, ALEX).status_code == 403
+        assert items_of(client, owned) == []
+
+    def test_lan_visitors_neither_see_nor_add_secret_ideas(self, client, owned, secret):
+        h = {"X-Wishlist": "1"}
+        assert client.lan("get", f"/api/people/{owned}/items").json["items"] == []
+        assert {p["id"]: p for p in client.lan("get", "/api/people").json}[owned]["count"] == 0
+        r = client.lan("post", f"/api/people/{owned}/ideas", json={"name": "x", "kind": "online"}, headers=h)
+        assert r.status_code == 403
+        assert client.lan("patch", f"/api/items/{secret}", json={"name": "x"}, headers=h).status_code == 404
+
+    def test_archived_secret_idea_is_revealed_as_a_gift(self, client, owned, secret):
+        client.post(f"/api/items/{secret}/purchase", GRANDMA, json={"by": "Grandma"})
+        assert client.post(f"/api/people/{owned}/archive", ADMIN).json == {"archived": 1}
+        hist = history(client, owned, ALEX)
+        assert [(i["name"], i["purchased_by"], i["secret"]) for i in hist] == [("Surprise drone", "Grandma", True)]
+        assert items_of(client, owned, ALEX) == []
+
+    # reservations
+    def test_owner_sees_reserved_items_as_open(self, client, owned):
+        iid = add(client, owned, name="Kite", price=7).json["id"]
+        reserve(client, iid, by="Grandma")
+        assert self.hidden(items_of(client, owned, ALEX)[0])
+        t = tab(client, owned, ALEX)
+        assert "reserved" not in t and t["count"] == 1
+        for path in ("/api/people", f"/api/people/{owned}/items"):
+            assert "Grandma" not in client.get(path, ALEX).get_data(as_text=True)
+        assert self.hidden(client.patch(f"/api/items/{iid}", ALEX, json={"notes": "blue"}).json)
+
+    def test_owner_cannot_probe_with_reserve_or_release(self, client, owned):
+        reserved, open_ = add(client, owned).json["id"], add(client, owned).json["id"]
+        reserve(client, reserved, by="Grandma")
+        for body in ({}, {"reserved": False}):
+            a, b = reserve(client, reserved, ALEX, **body), reserve(client, open_, ALEX, **body)
+            assert (a.status_code, a.json) == (b.status_code, b.json) and a.status_code == 403
+        assert {i["id"]: i for i in items_of(client, owned, GRANDMA)}[reserved]["reserved_by"] == "Grandma"
+
+    def test_owner_deleting_a_reserved_item_keeps_it_for_the_reserver(self, client, owned):
+        kite, yoyo = add(client, owned, name="Kite").json["id"], add(client, owned, name="Yo-yo").json["id"]
+        reserve(client, kite)
+        a, b = client.delete(f"/api/items/{kite}", ALEX), client.delete(f"/api/items/{yoyo}", ALEX)
+        assert (a.status_code, a.json) == (b.status_code, b.json) == (200, {"ok": True})
+        assert items_of(client, owned, ALEX) == []
+        assert [(i["name"], i["removed_by_owner"]) for i in items_of(client, owned, GRANDMA)] == [("Kite", True)]
+        # once released there is nothing left to keep
+        assert reserve(client, kite, reserved=False).json == {"deleted": True}
+        assert items_of(client, owned, GRANDMA) == []
+
+    # archive
+    def test_owner_sees_nothing_until_archived_then_the_giver(self, client, owned, bought):
+        assert history(client, owned, ALEX) == [] and tab(client, owned, ALEX)["archived"] == 0
+        assert client.post(f"/api/people/{owned}/archive", ADMIN).json == {"archived": 1}
+        assert [(i["name"], i["purchased"], i["purchased_by"]) for i in history(client, owned, ALEX)] == [
+            ("Bought", True, "Grandma")]
+        assert [i["name"] for i in items_of(client, owned, ALEX)] == ["Open"]
+        t = tab(client, owned, ALEX)
+        assert (t["count"], t["archived"]) == (1, 1) and "bought" not in t
+
+    def test_owner_cannot_probe_with_archive(self, client, owned, bought):
+        open_ = next(i["id"] for i in items_of(client, owned, ALEX) if i["name"] == "Open")
+        for body in ({}, {"archived": False}):
+            a = client.post(f"/api/items/{bought}/archive", ALEX, json=body)
+            b = client.post(f"/api/items/{open_}/archive", ALEX, json=body)
+            assert (a.status_code, a.json) == (b.status_code, b.json) and a.status_code == 403
+        assert client.post(f"/api/people/{owned}/archive", ALEX).status_code == 403
+        assert history(client, owned, GRANDMA) == []
+
+    def test_owner_removed_items_stay_hidden_after_archiving(self, client, owned, bought):
+        client.delete(f"/api/items/{bought}", ALEX)
+        client.post(f"/api/people/{owned}/archive", ADMIN)
+        assert history(client, owned, ALEX) == [] and tab(client, owned, ALEX)["archived"] == 0
+        assert [i["name"] for i in history(client, owned, GRANDMA)] == ["Bought"]
 
 
 # ------------------------------------------------------------------ tabs

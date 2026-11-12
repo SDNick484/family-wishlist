@@ -26,16 +26,20 @@ const ctx = vm.createContext({
   },
 });
 vm.runInContext(src, ctx, { filename: "app.js" });
-const { esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure, shouldRefresh } =
-  vm.runInContext("({ esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure, shouldRefresh })", ctx);
+const { esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure, shouldRefresh,
+        visibleItems, occasionsIn, canAddIdea } =
+  vm.runInContext(`({ esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure,
+                      shouldRefresh, visibleItems, occasionsIn, canAddIdea })`, ctx);
 
 const item = (over = {}) => ({
   id: 1, person_id: 1, name: "Thing", kind: "online", url: null, store: null, price: null, priority: 2,
   notes: null, position: 0, created_at: 1700000000, purchased: false, purchased_by: null,
-  purchased_at: null, mine: false, removed_by_owner: false, photo_url: null, thumb_url: null, ...over,
+  purchased_at: null, mine: false, removed_by_owner: false, photo_url: null, thumb_url: null, occasion: null,
+  secret: false, my_idea: false, created_by: "Dad", reserved_by: null, reserved_at: null, reserved_mine: false,
+  archived_at: null, ...over,
 });
 const as = (role, isMe = false) => {
-  state.me = { role, name: "Tester", source: "cloudflare" };
+  state.me = { role, name: "Tester", source: "cloudflare", email: "tester@example.com" };
   state.person = { id: 1, name: "Alex", is_me: isMe };
 };
 const names = list => list.map(i => i.name).join("");
@@ -132,6 +136,80 @@ test("move buttons only in manual order, and not on purchased items", () => {
   assert.ok(itemHTML(item(), true).includes('data-act="up"'));
   assert.ok(!itemHTML(item(), false).includes('data-act="up"'));
   assert.ok(!itemHTML(item({ purchased: true, purchased_by: "G", purchased_at: 1 }), true).includes('data-act="up"'));
+});
+
+const acts = html => [...html.matchAll(/data-act="(\w+)"/g)].map(m => m[1]);
+
+test("open items offer Reserve beside Mark purchased", () => {
+  as("shopper");
+  assert.deepEqual(acts(itemHTML(item(), false)), ["buy", "reserve"]);
+});
+
+test("someone else's reservation blocks buying; only an editor can release it", () => {
+  const held = { reserved_by: "Grandma", reserved_at: 1700000000 };
+  as("shopper");
+  const html = itemHTML(item(held), false);
+  assert.ok(html.includes("Reserved by Grandma"));
+  assert.deepEqual(acts(html), []);
+  as("editor");
+  assert.deepEqual(acts(itemHTML(item(held), false)), ["release", "edit", "del"]);
+});
+
+test("the reserver can mark purchased or release", () => {
+  as("shopper");
+  assert.deepEqual(acts(itemHTML(item({ reserved_by: "Me", reserved_at: 1, reserved_mine: true }), false)), ["buy", "release"]);
+});
+
+test("the owner's own tab shows no reservation controls or state", () => {
+  as("editor", true);
+  const html = itemHTML(item({ reserved_by: "Grandma", reserved_at: 1, reserved_mine: true }), false);
+  for (const leak of ['data-act="reserve"', 'data-act="release"', "Reserved by", "Grandma"]) assert.ok(!html.includes(leak), leak);
+});
+
+test("secret ideas are labelled, and their author can edit them but not reorder", () => {
+  as("shopper");
+  const evil = "<b>x</b>";
+  const html = itemHTML(item({ secret: true, my_idea: true, created_by: evil }), true);
+  assert.ok(html.includes("Secret idea from &lt;b&gt;x&lt;/b&gt;") && html.includes('class="item secret'));
+  assert.deepEqual(acts(html), ["buy", "reserve", "edit", "del"]);
+  assert.deepEqual(acts(itemHTML(item({ secret: true, created_by: "Dad" }), true)), ["buy", "reserve"]);
+});
+
+test("only signed-in visitors to someone else's tab can add secret ideas", () => {
+  as("shopper");
+  assert.equal(canAddIdea(state.person), true);
+  assert.equal(canAddIdea({ ...state.person, is_me: true }), false);
+  assert.equal(canAddIdea(null), false);
+  state.me = { role: "editor", name: "Home", source: "lan", email: null };
+  assert.equal(canAddIdea(state.person), false);
+});
+
+test("editors can archive purchased items, and restore them from History", () => {
+  const bought = { purchased: true, purchased_by: "Grandma", purchased_at: 1700000000 };
+  as("editor");
+  assert.ok(acts(itemHTML(item(bought), false)).includes("archive"));
+  assert.deepEqual(acts(itemHTML(item({ ...bought, archived_at: 1700000500 }), false)), ["restore", "del"]);
+  as("shopper");
+  assert.ok(!acts(itemHTML(item(bought), false)).includes("archive"));
+});
+
+test("History shows the owner who gave each gift, without restore", () => {
+  as("editor", true);
+  const html = itemHTML(item({ purchased: true, purchased_by: "Grandma", purchased_at: 1700000000, archived_at: 1700000500 }), false);
+  assert.ok(html.includes("Given by Grandma"));
+  assert.ok(!html.includes('data-act="restore"'));
+});
+
+test("occasion tags are escaped and drive the filter", () => {
+  as("shopper");
+  assert.ok(itemHTML(item({ occasion: "<i>Xmas</i>" }), false).includes('<span class="tag">&lt;i&gt;Xmas&lt;/i&gt;</span>'));
+  const list = [item({ id: 1, name: "a", occasion: "birthday" }), item({ id: 2, name: "b", occasion: "Christmas" }),
+                item({ id: 3, name: "c", occasion: "Christmas", purchased: true }), item({ id: 4, name: "d" })];
+  assert.equal(occasionsIn(list).join(), "birthday,Christmas");
+  assert.equal(names(visibleItems(list, { sortKey: "manual", occasion: "Christmas" })), "bc");
+  assert.equal(names(visibleItems(list, { sortKey: "manual", occasion: "Christmas", showBought: false })), "b");
+  assert.equal(names(visibleItems(list, { sortKey: "name" })), "abdc"); // purchased still sink
+  assert.equal(names(visibleItems([list[3], list[0]], {})), "da"); // no sort key keeps the server's order
 });
 
 test("priority stars: 1 is three stars, 3 is one", () => {

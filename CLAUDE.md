@@ -23,15 +23,20 @@ SEED_PEOPLE="Alex,Sam" python3 app.py  # http://localhost:8766, LAN requests are
 ## Rules that must keep holding
 
 - **Spoiler protection.** The owner of a tab (`people.owner_email` == signed-in email) must never
-  learn what was bought for them, from any endpoint: no purchase state, buyer names, bought counts,
-  or differences in status codes. `item_json(row, owner_view)` strips the fields; `list_people`
-  omits `bought`/`remaining`; items the owner removed after purchase (`removed_by_owner`) are hidden
-  from the owner only. Any new field or endpoint that reveals gift state needs the same treatment
-  and a test in `TestSpoilersMore`.
+  learn what was bought or reserved for them, from any endpoint: no purchase or reservation state,
+  buyer names, bought counts, or differences in status codes. `item_json(row, owner_view)` strips
+  the fields; `list_people` omits `bought`/`reserved`/`remaining`. `can_see(item, owner)` decides
+  which items exist for a user, and `get_item`/`tab_items` go through it, so a hidden item answers
+  exactly like a missing id: items the owner removed after purchase or reservation
+  (`removed_by_owner`) and secret ideas (`secret`; also hidden from LAN users) are hidden from the
+  owner. Archiving (`archived_at`) is the one deliberate reveal: archived gifts show the owner who
+  gave them. Any new field or endpoint that reveals gift state needs the same treatment and a test
+  in `TestSpoilersMore`.
 - **Identity.** Email comes only from a verified Cloudflare Access JWT. Requests with any Cloudflare
   header or token never fall back to the LAN role. LAN users have no email, so they are never owners.
 - **Roles.** `editor` (in `ADMIN_EMAILS` or a member marked editor) can change things; everyone else
-  is a `shopper` who can view and mark purchased. Guard mutating routes with `@editor_required`.
+  is a `shopper` who can view, reserve, mark purchased and add secret ideas. Guard mutating routes
+  with `@editor_required`, or `require_edit(item)` where the author of a secret idea may also act.
 - **CSRF.** Mutations need the `X-Wishlist: 1` header and a JSON body (multipart only for photo upload).
 - **Input.** Read bodies with `json_body()` and string fields with `text(data, key)` so bad shapes
   return 400. Never store non-finite numbers: they serialize to invalid JSON.
