@@ -5,4 +5,4 @@ pyjwt[crypto]>=2.8
 pillow>=10
 
 # Tests
-pytest>=8
+pytest>=9.2.0
