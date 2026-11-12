@@ -1,9 +1,6 @@
-"""Items, purchases, spoiler protection, tabs and photos: edge cases not covered in test_app.py.
-
-Tests marked xfail(strict=True) document known bugs; they start failing the suite
-(as XPASS) once the bug is fixed, which is the cue to remove the marker.
-"""
+"""Items, purchases, spoiler protection, tabs and photos: edge cases not covered in test_app.py."""
 import io
+import sqlite3
 
 import pytest
 from PIL import Image
@@ -69,18 +66,14 @@ class TestItemFields:
     def test_bad_prices_rejected(self, client, people, price):
         assert add(client, people["Alex"], price=price).status_code == 400
 
-    @pytest.mark.xfail(strict=True, reason="BUG: 'inf'/'1e999' are stored and then serialized as bare "
-                                           "Infinity, which is not valid JSON, so the browser can no "
-                                           "longer load /api/people for anyone")
-    @pytest.mark.parametrize("price", ["inf", "Infinity", "1e999"])
+    @pytest.mark.parametrize("price", ["inf", "-inf", "Infinity", "1e999", "nan", 1e999])
     def test_non_finite_price_rejected(self, client, people, price):
+        # bare Infinity/NaN isn't valid JSON: one such price would stop every browser loading the tabs
         assert add(client, people["Alex"], price=price).status_code == 400
-
-    def test_nan_price_does_not_poison_totals(self, client, people):
-        add(client, people["Alex"], price="nan")
-        add(client, people["Alex"], price=5)
+        iid = add(client, people["Alex"], price=5).json["id"]
+        assert client.patch(f"/api/items/{iid}", ADMIN, json={"price": price}).status_code == 400
         raw = client.get("/api/people", GRANDMA).get_data(as_text=True)
-        assert "NaN" not in raw and tab(client, people["Alex"], GRANDMA)["remaining"] == 5
+        assert "Infinity" not in raw and "NaN" not in raw
 
     @pytest.mark.parametrize("given,stored", [(1, 1), ("3", 3), (0, 1), (-5, 1), (9, 3)])
     def test_priority_is_clamped(self, client, people, given, stored):
@@ -110,12 +103,28 @@ class TestItemFields:
         name = '<img src=x onerror=alert(1)> & "quotes"'
         assert add(client, people["Alex"], name=name, notes=name).json["notes"] == name
 
-    @pytest.mark.xfail(strict=True, reason="BUG: malformed JSON shapes raise instead of returning 400")
-    @pytest.mark.parametrize("body", [[1], {"name": 5, "kind": "online"},
-                                      {"name": "x", "kind": "online", "priority": 1e999}])
+    @pytest.mark.parametrize("body", [[1], "text", 7, {"name": 5, "kind": "online"},
+                                      {"name": "x", "kind": "online", "priority": 1e999},
+                                      {"name": "x", "kind": "online", "url": ["a"]},
+                                      {"name": "x", "kind": "online", "notes": {"a": 1}}])
     def test_malformed_bodies_are_a_400_not_a_500(self, client, people, body):
         r = client.post(f"/api/people/{people['Alex']}/items", ADMIN, json=body)
-        assert r.status_code == 400
+        assert r.status_code == 400 and r.json["error"]
+
+    @pytest.mark.parametrize("method,path,body", [
+        ("post", "/api/people", {"name": 5}),
+        ("post", "/api/people", {"name": "X", "color": 255}),
+        ("post", "/api/people", [1]),
+        ("patch", "/api/people/1", {"owner_email": ["a@example.com"]}),
+        ("put", "/api/members", {"email": 5, "display_name": "G"}),
+        ("put", "/api/members", [1]),
+        ("post", "/api/items/1/move", [1]),
+        ("post", "/api/items/1/purchase", {"by": 5}),
+        ("post", "/api/items/1/purchase", [1]),
+    ])
+    def test_malformed_bodies_elsewhere_are_a_400(self, client, people, method, path, body):
+        add(client, people["Alex"])
+        assert client.req(method, path, ADMIN, json=body).status_code == 400
 
 
 class TestItemEditing:
@@ -188,8 +197,6 @@ class TestOrdering:
         client.post(f"/api/items/{abc['C']}/move", ADMIN, json={"dir": "up"})
         assert order(client, people["Alex"]) == ["C", "A", "D"]
 
-    @pytest.mark.xfail(strict=True, reason="BUG: items the owner removed after purchase still take part in "
-                                           "reordering, so the owner's Move button can silently do nothing")
     def test_owner_reorder_skips_items_hidden_from_them(self, client, owned):
         ids = {n: add(client, owned, name=n).json["id"] for n in "ABC"}
         client.post(f"/api/items/{ids['B']}/purchase", GRANDMA)
@@ -197,6 +204,14 @@ class TestOrdering:
         assert order(client, owned, ALEX) == ["A", "C"]
         client.post(f"/api/items/{ids['C']}/move", ALEX, json={"dir": "up"})
         assert order(client, owned, ALEX) == ["C", "A"]
+        client.post(f"/api/items/{ids['C']}/move", ALEX, json={"dir": "down"})
+        assert order(client, owned, ALEX) == ["A", "C"]
+        # everyone else still sees all three, and moves one visible step at a time
+        assert sorted(order(client, owned)) == ["A", "B", "C"]
+        before = order(client, owned)
+        client.post(f"/api/items/{ids['A']}/move", ADMIN, json={"dir": "down"})
+        after = order(client, owned)
+        assert after.index("A") == before.index("A") + 1
 
 
 # ------------------------------------------------------------------ purchases
@@ -244,6 +259,27 @@ class TestPurchasesMore:
         r = client.post(f"/api/items/{iid}/purchase", "uncle@example.com")
         assert r.status_code == 400 and "Grandma" in r.json["error"]
         assert {i["id"]: i for i in items_of(client, people["Alex"])}[iid]["purchased_by"] == "Grandma"
+
+    def test_simultaneous_purchases_only_one_wins(self, client, people, monkeypatch):
+        """Two shoppers tap at once: the second request read the item before the first one committed."""
+        iid = add(client, people["Alex"]).json["id"]
+        real_get_item = wishlist.get_item
+
+        def stale_read(item_id):
+            row = real_get_item(item_id)
+            monkeypatch.setattr(wishlist, "get_item", real_get_item)  # only the first read is stale
+            other = sqlite3.connect(wishlist.DB_PATH)
+            other.execute("UPDATE items SET purchased = 1, purchased_by = 'Grandma', "
+                          "purchased_by_email = ?, purchased_at = 1 WHERE id = ?", (GRANDMA, item_id))
+            other.commit()
+            other.close()
+            return row
+
+        monkeypatch.setattr(wishlist, "get_item", stale_read)
+        r = client.post(f"/api/items/{iid}/purchase", "uncle@example.com", json={"by": "Uncle"})
+        assert r.status_code == 400 and "Grandma" in r.json["error"]
+        item = items_of(client, people["Alex"], GRANDMA)[0]
+        assert item["purchased_by"] == "Grandma" and item["mine"] is True
 
     def test_tab_stats_ignore_unpriced_and_owner_removed_items(self, client, owned):
         a = add(client, owned, price=10).json["id"]

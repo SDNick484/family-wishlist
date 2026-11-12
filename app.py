@@ -14,6 +14,7 @@ Environment:
 Photos are stored re-encoded as JPEG under DATA_DIR/photos (needs Pillow).
 """
 import ipaddress
+import math
 import os
 import warnings
 import re
@@ -296,8 +297,26 @@ def remove_photo_files(*item_ids):
                 pass
 
 
-def clean_color(value):
-    value = (value or "").strip()
+def json_body():
+    data = request.get_json()
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        abort(400, "Expected a JSON object.")
+    return data
+
+
+def text(data, key):
+    value = data.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        abort(400, f"{key} must be text.")
+    return value.strip()
+
+
+def clean_color(data):
+    value = text(data, "color")
     if not value:
         return None
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
@@ -308,7 +327,7 @@ def clean_color(value):
 def clean_item_payload(data, partial=False):
     out = {}
     if "name" in data or not partial:
-        name = (data.get("name") or "").strip()
+        name = text(data, "name")
         if not name:
             abort(400, "Item name is required.")
         out["name"] = name[:200]
@@ -318,7 +337,7 @@ def clean_item_payload(data, partial=False):
             abort(400, "Kind must be 'online' or 'store'.")
         out["kind"] = kind
     if "url" in data:
-        url = (data.get("url") or "").strip()
+        url = text(data, "url")
         scheme = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*):(?!\d)", url)
         if scheme and scheme.group(1).lower() not in ("http", "https"):
             abort(400, "Link must be an http(s) URL.")
@@ -328,7 +347,7 @@ def clean_item_payload(data, partial=False):
             abort(400, "Link must be an http(s) URL.")
         out["url"] = url[:2000] or None
     if "store" in data:
-        out["store"] = (data.get("store") or "").strip()[:120] or None
+        out["store"] = text(data, "store")[:120] or None
     if "price" in data:
         p = data.get("price")
         if p in (None, ""):
@@ -336,18 +355,20 @@ def clean_item_payload(data, partial=False):
         else:
             try:
                 out["price"] = round(float(str(p).replace("$", "").replace(",", "").strip()), 2)
-            except ValueError:
+            except (ValueError, OverflowError):
+                abort(400, "Price must be a number.")
+            if not math.isfinite(out["price"]):  # inf/nan aren't valid JSON and would break every client
                 abort(400, "Price must be a number.")
             if out["price"] < 0:
                 abort(400, "Price can't be negative.")
     if "priority" in data:
         try:
             pr = int(data.get("priority"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             abort(400, "Priority must be 1, 2 or 3.")
         out["priority"] = min(3, max(1, pr))
     if "notes" in data:
-        out["notes"] = (data.get("notes") or "").strip()[:1000] or None
+        out["notes"] = text(data, "notes")[:1000] or None
     return out
 
 
@@ -408,7 +429,7 @@ def list_items(pid):
 @editor_required
 def add_item(pid):
     get_person(pid)
-    data = clean_item_payload(request.get_json() or {})
+    data = clean_item_payload(json_body())
     data.setdefault("priority", 2)
     pos = db().execute("SELECT COALESCE(MAX(position), -1) + 1 FROM items WHERE person_id = ?",
                        (pid,)).fetchone()[0]
@@ -425,7 +446,7 @@ def add_item(pid):
 @editor_required
 def edit_item(iid):
     item = get_item(iid)
-    data = clean_item_payload(request.get_json() or {}, partial=True)
+    data = clean_item_payload(json_body(), partial=True)
     if data:
         sets = ", ".join(f"{k} = ?" for k in data)
         db().execute(f"UPDATE items SET {sets} WHERE id = ?", (*data.values(), iid))
@@ -451,13 +472,17 @@ def delete_item(iid):
 @editor_required
 def move_item(iid):
     item = get_item(iid)
-    direction = (request.get_json() or {}).get("dir")
-    rows = db().execute("SELECT id FROM items WHERE person_id = ? ORDER BY position, id",
+    direction = json_body().get("dir")
+    rows = db().execute("SELECT id, removed_by_owner FROM items WHERE person_id = ? ORDER BY position, id",
                         (item["person_id"],)).fetchall()
     ids = [r["id"] for r in rows]
-    i = ids.index(iid)
-    j = i - 1 if direction == "up" else i + 1
-    if 0 <= j < len(ids):
+    # Swap with the neighbor the user can see: the owner's view leaves out removed items.
+    owner = is_owner(get_person(item["person_id"]))
+    seen = [n for n, r in enumerate(rows) if r["id"] == iid or not (owner and r["removed_by_owner"])]
+    k = seen.index(ids.index(iid))
+    k2 = k - 1 if direction == "up" else k + 1
+    if 0 <= k2 < len(seen):
+        i, j = seen[k], seen[k2]
         ids[i], ids[j] = ids[j], ids[i]
         for pos, x in enumerate(ids):
             db().execute("UPDATE items SET position = ? WHERE id = ?", (pos, x))
@@ -470,14 +495,15 @@ def purchase(iid):
     item = get_item(iid)
     if is_owner(get_person(item["person_id"])):
         abort(403, "That's your own list — no peeking!")
-    data = request.get_json() or {}
+    data = json_body()
     if data.get("purchased", True):
-        if item["purchased"]:
-            abort(400, f"Already marked as purchased by {item['purchased_by']}.")
-        who = (data.get("by") or "").strip()[:80] or g.user["name"]
-        db().execute("UPDATE items SET purchased = 1, purchased_by = ?, purchased_by_email = ?, "
-                     "purchased_at = ? WHERE id = ?",
-                     (who, g.user["email"], int(time.time()), iid))
+        who = text(data, "by")[:80] or g.user["name"]
+        # Claim it in one statement so two shoppers tapping at once can't both succeed.
+        cur = db().execute("UPDATE items SET purchased = 1, purchased_by = ?, purchased_by_email = ?, "
+                           "purchased_at = ? WHERE id = ? AND purchased = 0",
+                           (who, g.user["email"], int(time.time()), iid))
+        if cur.rowcount == 0:
+            abort(400, f"Already marked as purchased by {get_item(iid)['purchased_by']}.")
     else:
         mine = g.user["email"] and item["purchased_by_email"] == g.user["email"]
         if not (mine or g.user["role"] == "editor"):
@@ -570,12 +596,12 @@ def get_photo(iid, size):
 @app.post("/api/people")
 @editor_required
 def add_person():
-    data = request.get_json() or {}
-    name = (data.get("name") or "").strip()[:60]
+    data = json_body()
+    name = text(data, "name")[:60]
     if not name:
         abort(400, "Name is required.")
-    owner = (data.get("owner_email") or "").strip().lower() or None
-    color = clean_color(data.get("color"))
+    owner = text(data, "owner_email").lower() or None
+    color = clean_color(data)
     pos = db().execute("SELECT COALESCE(MAX(position), -1) + 1 FROM people").fetchone()[0]
     cur = db().execute("INSERT INTO people (name, owner_email, position, color) VALUES (?,?,?,?)",
                        (name, owner, pos, color))
@@ -587,17 +613,17 @@ def add_person():
 @editor_required
 def edit_person(pid):
     get_person(pid)
-    data = request.get_json() or {}
+    data = json_body()
     if "name" in data:
-        name = (data.get("name") or "").strip()[:60]
+        name = text(data, "name")[:60]
         if not name:
             abort(400, "Name is required.")
         db().execute("UPDATE people SET name = ? WHERE id = ?", (name, pid))
     if "color" in data:
-        db().execute("UPDATE people SET color = ? WHERE id = ?", (clean_color(data["color"]), pid))
+        db().execute("UPDATE people SET color = ? WHERE id = ?", (clean_color(data), pid))
     if "owner_email" in data:
         db().execute("UPDATE people SET owner_email = ? WHERE id = ?",
-                     ((data.get("owner_email") or "").strip().lower() or None, pid))
+                     (text(data, "owner_email").lower() or None, pid))
     if data.get("move") in ("up", "down"):
         ids = [r["id"] for r in db().execute("SELECT id FROM people ORDER BY position, id")]
         i = ids.index(pid)
@@ -631,9 +657,9 @@ def list_members():
 @app.put("/api/members")
 @editor_required
 def upsert_member():
-    data = request.get_json() or {}
-    email = (data.get("email") or "").strip().lower()
-    name = (data.get("display_name") or "").strip()[:60]
+    data = json_body()
+    email = text(data, "email").lower()
+    name = text(data, "display_name")[:60]
     role = data.get("role", "shopper")
     if "@" not in email or not name or role not in ("editor", "shopper"):
         abort(400, "Need an email, a display name and a role (editor or shopper).")

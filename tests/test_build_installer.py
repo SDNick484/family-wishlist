@@ -98,17 +98,11 @@ class TestGeneratedScript:
         s = build(tmp_path, monkeypatch, "ADMIN_EMAILS=me@example.com\n")
         assert 'SEED_PEOPLE="${SEED_PEOPLE:-}"' in s
 
-    @pytest.mark.parametrize("bad", ['a"b', "a`id`", "$(id)", "a\\b"])
+    @pytest.mark.parametrize("bad", ['a"b', "a`id`", "$(id)", "a\\b", "Pat}Lee"])
     def test_shell_metacharacters_are_refused(self, tmp_path, monkeypatch, bad):
         with pytest.raises(SystemExit):
             build(tmp_path, monkeypatch, f"ADMIN_EMAILS=me@example.com\nSEED_PEOPLE={bad}\n")
         assert not (tmp_path / "setup-wishlist.sh").exists()
-
-    @pytest.mark.xfail(strict=True, reason="BUG: '}' ends the ${VAR:-default} expansion early, so the "
-                                           "rest of the value leaks out as literal text in the config")
-    def test_closing_brace_is_refused(self, tmp_path, monkeypatch):
-        with pytest.raises(SystemExit):
-            build(tmp_path, monkeypatch, "SEED_PEOPLE=Pat}Lee\n")
 
 
 class TestTemplate:
@@ -122,15 +116,11 @@ class TestTemplate:
     def test_service_runs_unprivileged(self):
         assert 'command_user="wishlist"' in self.template
 
-    @pytest.mark.parametrize("var", ["ADMIN_EMAILS", "CF_TEAM_DOMAIN", "CF_AUD", "LAN_ROLE", "SEED_PEOPLE",
-                                     "PERSON_COLORS"])
+    @pytest.mark.parametrize("var", ["ADMIN_EMAILS", "CF_TEAM_DOMAIN", "CF_AUD", "LAN_ROLE", "LAN_NAME",
+                                     "SEED_PEOPLE", "PERSON_COLORS"])
     def test_documented_settings_reach_the_app(self, var):
+        # OpenRC only passes exported variables to the service
         assert var in self.exported
-
-    @pytest.mark.xfail(strict=True, reason="BUG: app.py reads LAN_NAME but the init script never exports "
-                                           "it, so setting it in /etc/conf.d/wishlist has no effect")
-    def test_lan_name_reaches_the_app(self):
-        assert "LAN_NAME" in self.exported
 
     def test_installed_packages_cover_requirements(self):
         apk = re.search(r"apk add --no-cache (.+?) >", self.template).group(1).split()

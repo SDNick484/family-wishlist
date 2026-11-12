@@ -75,8 +75,8 @@ def main():
 
     for key in KEYS:
         val = env.get(key, "")
-        # values land inside double quotes in a shell script
-        if re.search(r'["`$\\\n]', val):
+        # values land inside "${VAR:-...}" in a shell script
+        if re.search(r'["`$\\\n}]', val):
             sys.exit(f"{key} contains a character that isn't allowed here: {val!r}")
         env[key] = val
 

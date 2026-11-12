@@ -54,6 +54,8 @@ CF_AUD="${CF_AUD:-}"
 # Requests straight from your LAN (http://<ct-ip>:port, no Cloudflare):
 # editor | shopper | none
 LAN_ROLE="${LAN_ROLE:-editor}"
+# Name shown for LAN users (who added an item, default "who got it").
+LAN_NAME="${LAN_NAME:-Home}"
 
 # Tabs created on the very first start only (manage them later in Settings).
 SEED_PEOPLE="${SEED_PEOPLE:-@@SEED_PEOPLE@@}"
@@ -82,7 +84,7 @@ depend() { need net; after firewall; }
 start_pre() {
   # Family colors (fill tabs without a color; Settings overrides). Override in /etc/conf.d/wishlist.
   : ${PERSON_COLORS:="@@PERSON_COLORS@@"}
-  export DATA_DIR=/var/lib/wishlist ADMIN_EMAILS CF_TEAM_DOMAIN CF_AUD LAN_ROLE SEED_PEOPLE PERSON_COLORS
+  export DATA_DIR=/var/lib/wishlist ADMIN_EMAILS CF_TEAM_DOMAIN CF_AUD LAN_ROLE LAN_NAME SEED_PEOPLE PERSON_COLORS
   checkpath -f -o wishlist -m 0640 /var/log/wishlist.log
 }
 EOF
