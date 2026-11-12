@@ -5,11 +5,13 @@ Self-hosted wish list tracker: one tab per person, items with links/stores/price
 
 ## Layout
 
-- `app.py` — the whole server (Flask + SQLite, ~700 lines). Sections in order: database, identity,
-  helpers, routes, photos, settings.
+- `app.py` — the whole server (Flask + SQLite, ~1000 lines). Sections in order: database, identity,
+  helpers, routes, photos, link preview, settings.
 - `static/` — `index.html`, `app.js`, `style.css`. Plain browser JS, no build step, no dependencies.
 - `deploy/setup-wishlist.sh.in` + `tools/build_installer.py` — single-file installer for Alpine/OpenRC.
 - `tests/` — pytest suite; `frontend.test.mjs` holds the Node tests for `app.js`.
+- `.github/workflows/ci.yml` — pytest on pip packages (Python 3.12 and latest, with Node) and on
+  Alpine's `py3-*` packages. Dependabot keeps actions and pip pins current.
 
 ## Commands
 
@@ -40,6 +42,9 @@ SEED_PEOPLE="Alex,Sam" python3 app.py  # http://localhost:8766, LAN requests are
 - **CSRF.** Mutations need the `X-Wishlist: 1` header and a JSON body (multipart only for photo upload).
 - **Input.** Read bodies with `json_body()` and string fields with `text(data, key)` so bad shapes
   return 400. Never store non-finite numbers: they serialize to invalid JSON.
+- **Outbound fetches.** The server fetches URLs only through `_fetch` (link preview), which allows
+  http(s) to public addresses only, re-checks every redirect, connects to the address it checked, and
+  caps time and size. Tests stub `socket.getaddrinfo` and `_open`; never reach the real network.
 - **Frontend.** Everything user-typed goes through `esc()` before it reaches `innerHTML`. The CSP
   allows no inline scripts and images only from this origin.
 

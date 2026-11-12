@@ -234,6 +234,7 @@ dialog form.inline-form input.swatch { flex: none; width: 44px; }
 .item.has-photo .meta { grid-column: 2 / -1; align-self: start; }
 .item.bought .thumb { opacity: .5; filter: grayscale(.6); }
 
+.link-offer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: -4px; }
 .photo-field { display: grid; gap: 6px; border-radius: 12px; }
 .photo-field .field-label { font-size: .85rem; font-weight: 600; color: var(--muted); }
 .photo-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

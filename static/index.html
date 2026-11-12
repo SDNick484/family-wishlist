@@ -70,6 +70,10 @@
     </div>
     <label>Item<input name="name" required maxlength="200" placeholder="e.g. LEGO Botanical Orchid"></label>
     <label class="only-online">Link<input name="url" type="text" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="amazon.com/… or paste a link"></label>
+    <div class="link-offer only-online" id="linkOffer" hidden>
+      <button type="button" class="btn small" id="linkFill" hidden></button>
+      <span class="muted small" id="linkStatus"></span>
+    </div>
     <label class="only-store">Store<input name="store" maxlength="120" placeholder="e.g. Target, downtown" list="storeList"></label>
     <datalist id="storeList"></datalist>
     <div class="row">
