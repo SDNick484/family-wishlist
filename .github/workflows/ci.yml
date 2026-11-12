@@ -22,7 +22,7 @@ jobs:
       matrix:
         python: ["3.12", "3.x"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -41,5 +41,5 @@ jobs:
     container: alpine:latest
     steps:
       - run: apk add --no-cache python3 py3-flask py3-gunicorn py3-jwt py3-cryptography py3-pillow py3-pytest nodejs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: python3 -m pytest -q
