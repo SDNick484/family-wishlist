@@ -10,6 +10,8 @@ Tunnel with Cloudflare Access (email one-time PIN) in front of it.
 - **Backend:** Flask + SQLite (`app.py`), served by gunicorn under OpenRC
 - **Frontend:** plain HTML/CSS/JS in `static/`, no build step, installable as a phone home-screen app
 - **Photos:** Pillow; re-encoded to JPEG (max 1600 px + 400 px thumbnail), EXIF stripped
+- **Fill in from a link:** paste a product link and the item dialog offers the page's name, price and
+  photo (Open Graph tags or JSON-LD). Many shops block it; then the form just works as usual
 
 ## Layout
 
@@ -20,6 +22,7 @@ deploy/setup-wishlist.sh.in  installer template (Alpine + OpenRC)
 deploy/deploy.env.example    household defaults for the installer -> copy to deploy/deploy.env
 tools/build_installer.py     builds dist/setup-wishlist.sh (app embedded as a base64 tarball)
 tests/                       pytest suite
+.github/                     CI (pytest on pip packages and on Alpine's py3-* packages) and Dependabot
 ```
 
 ## Run it locally
@@ -79,6 +82,11 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
    what. Secret ideas need a Cloudflare sign-in; LAN visitors can't see or add them.
 5. Mutating requests need the `X-Wishlist: 1` header plus a JSON (or photo multipart) body and a same-origin
    `Origin`, which blocks cross-site request forgery.
+6. **Link previews** (`POST /api/preview`, editors only) are the one time the server fetches a URL it was
+   given. It only speaks http(s), refuses hosts that resolve to private, loopback, link-local or other
+   non-public addresses (re-checked on each of at most 3 redirects, and the connection goes to the address
+   that was checked), and gives up after 5 seconds, 1 MB of page or 20 MB of image. The photo is
+   downloaded and re-encoded like an upload, so the page never loads images from other sites.
 
 ## Backups
 

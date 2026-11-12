@@ -13,16 +13,23 @@ Environment:
 
 Photos are stored re-encoded as JPEG under DATA_DIR/photos (needs Pillow).
 """
+import base64
+import http.client
+import io
 import ipaddress
+import json
 import math
 import os
+import socket
+import ssl
 import warnings
 import re
 import sqlite3
 import time
 from collections import Counter
 from functools import wraps
-from urllib.parse import urlparse
+from html.parser import HTMLParser
+from urllib.parse import quote, urljoin, urlparse
 
 from flask import Flask, abort, g, jsonify, request, send_from_directory
 
@@ -168,7 +175,7 @@ def _is_private(addr):
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return False
-    return ip.is_private or ip.is_loopback
+    return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
 def _verify_cf_token(token):
@@ -690,11 +697,15 @@ def _flatten(img):
     return img.convert("RGB")
 
 
-def _save_jpeg(img, path, max_side):
+def _write_jpeg(img, fp, max_side):
     out = img.copy()
     out.thumbnail((max_side, max_side), Image.LANCZOS)
+    out.save(fp, "JPEG", quality=84, optimize=True, progressive=True)
+
+
+def _save_jpeg(img, path, max_side):
     tmp = path + ".tmp"
-    out.save(tmp, "JPEG", quality=84, optimize=True, progressive=True)
+    _write_jpeg(img, tmp, max_side)
     os.replace(tmp, path)
 
 
@@ -746,6 +757,290 @@ def get_photo(iid, size):
     # URL carries ?v=<version>, so a changed photo gets a new URL; cache privately.
     resp.headers["Cache-Control"] = "private, max-age=31536000, immutable"
     return resp
+
+
+# ---------------------------------------------------------------- link preview
+# The server fetches links an editor pastes, so each hop is checked to stay off the home network:
+# http(s) only, every resolved address public, and the connection goes to the address checked.
+PREVIEW_TIMEOUT = 5                    # seconds per fetch, redirects included
+PREVIEW_PAGE_MAX = 1024 * 1024         # bytes of a page read; the tags we want are near the top
+PREVIEW_IMAGE_MAX = 20 * 1024 * 1024
+PREVIEW_REDIRECTS = 3
+PREVIEW_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
+PREVIEW_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FamilyWishList/1.0; +link preview)",
+                   "Accept-Encoding": "identity", "Connection": "close"}
+
+
+class PreviewError(Exception):
+    """The link couldn't be read. The reason is logged, never shown: failing is normal."""
+
+
+def _public_ip(addr):
+    """Whether the server may connect to `addr`: a global unicast address, nothing at home."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.version == 6:
+        if ip.sixtofour or ip.teredo:  # tunnels that wrap an IPv4 address nobody checked
+            return False
+        ip = ip.ipv4_mapped or ip
+    return ip.is_global and not ip.is_multicast and not _is_private(str(ip))
+
+
+def _resolve(host, port):
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise PreviewError(f"can't resolve {host}: {exc}") from exc
+    return [info[4][0] for info in infos]
+
+
+class _PinnedHTTP(http.client.HTTPConnection):
+    """Connects to an address checked in advance, so a second DNS answer can't point it home."""
+
+    def __init__(self, host, port, ip, timeout):
+        super().__init__(host, port, timeout=timeout)
+        self.ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self.ip, self.port), self.timeout)
+
+
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    def __init__(self, host, port, ip, timeout):
+        self.tls = ssl.create_default_context()
+        super().__init__(host, port, timeout=timeout, context=self.tls)
+        self.ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self.ip, self.port), self.timeout)
+        self.sock = self.tls.wrap_socket(sock, server_hostname=self.host)  # certificate checked for the name
+
+
+def _open(url, ip, timeout):
+    """GET `url` from the address `ip`. The one place that touches the network (tests stub it)."""
+    u = urlparse(url)
+    cls = _PinnedHTTPS if u.scheme == "https" else _PinnedHTTP
+    conn = cls(u.hostname, u.port, ip, timeout)
+    path = quote(u.path or "/", safe="!$%&'()*+,/:;=@~") + (f"?{quote(u.query, safe='!$%&()*+,/:;=?@~')}"
+                                                            if u.query else "")
+    conn.request("GET", path, headers=PREVIEW_HEADERS)
+    return conn.getresponse()
+
+
+def _read(resp, limit, deadline):
+    """Up to limit + 1 bytes of the body, so the caller can tell whether there was more."""
+    body = bytearray()
+    while len(body) <= limit:
+        if time.monotonic() > deadline:
+            raise PreviewError("timed out")
+        chunk = resp.read1(min(64 * 1024, limit + 1 - len(body)))
+        if not chunk:
+            break
+        body += chunk
+    return bytes(body)
+
+
+def _fetch(url, accept, limit, truncate=False):
+    """Fetch an http(s) URL whose Content-Type starts with `accept`: (final URL, Content-Type, body).
+
+    Follows up to PREVIEW_REDIRECTS redirects, checking every hop. A body over `limit` bytes is
+    refused, or cut at `limit` when `truncate` is set.
+    """
+    deadline = time.monotonic() + PREVIEW_TIMEOUT
+    for _hop in range(PREVIEW_REDIRECTS + 1):
+        u = urlparse(url)
+        try:
+            host = u.hostname.encode("idna").decode("ascii") if u.hostname else ""
+            port = u.port or (443 if u.scheme == "https" else 80)
+        except (UnicodeError, ValueError) as exc:
+            raise PreviewError(f"bad link {url!r}") from exc
+        if u.scheme not in ("http", "https") or not host:
+            raise PreviewError(f"not an http(s) link: {url!r}")
+        addrs = _resolve(host, port)
+        if not addrs or not all(_public_ip(a) for a in addrs):
+            raise PreviewError(f"{host} resolves to a private address")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise PreviewError("timed out")
+        try:
+            resp = _open(u._replace(netloc=f"[{host}]:{port}" if ":" in host else f"{host}:{port}").geturl(),
+                         addrs[0], left)
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise PreviewError(f"fetching {host} failed: {exc}") from exc
+        try:
+            if resp.status in (301, 302, 303, 307, 308):
+                location = (resp.getheader("Location") or "").strip()
+                if not location:
+                    raise PreviewError("redirect without a Location")
+                url = urljoin(url, location)
+                continue
+            if resp.status != 200:
+                raise PreviewError(f"{host} answered {resp.status}")
+            ctype = resp.getheader("Content-Type") or ""
+            if not ctype.split(";")[0].strip().lower().startswith(accept):
+                raise PreviewError(f"{host} sent {ctype or 'no Content-Type'}, not {accept}")
+            if (resp.getheader("Content-Encoding") or "identity").strip().lower() != "identity":
+                raise PreviewError(f"{host} sent an encoded body")
+            length = resp.getheader("Content-Length") or ""
+            if not truncate and length.isdigit() and int(length) > limit:
+                raise PreviewError(f"{host} sent {length} bytes")
+            try:
+                body = _read(resp, limit, deadline)
+            except (OSError, http.client.HTTPException) as exc:
+                raise PreviewError(f"reading {host} failed: {exc}") from exc
+            if len(body) > limit:
+                if not truncate:
+                    raise PreviewError(f"{host} sent more than {limit} bytes")
+                body = body[:limit]
+            return url, ctype, body
+        finally:
+            resp.close()
+    raise PreviewError("too many redirects")
+
+
+class _PageMeta(HTMLParser):
+    """Collects <meta> values, the <title> and JSON-LD blocks from a page."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.meta, self.title, self.ld = {}, "", []
+        self._in, self._buf = None, []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): v or "" for k, v in attrs}
+        key = (a.get("property") or a.get("name") or a.get("itemprop") or "").strip().lower()
+        if key and "content" in a:
+            self.meta.setdefault(key, a["content"].strip())
+        if tag == "title" and not self.title:
+            self._in, self._buf = "title", []
+        elif tag == "script" and a.get("type", "").split(";")[0].strip().lower() == "application/ld+json":
+            self._in, self._buf = "ld", []
+
+    def handle_data(self, data):
+        if self._in:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if self._in == "title" and tag == "title":
+            self.title = "".join(self._buf)
+        elif self._in == "ld" and tag == "script":
+            self.ld.append("".join(self._buf))
+        else:
+            return
+        self._in = None
+
+
+def _price(value):
+    """A price from a page: 19.99, "1,299.00", "$19.99" or "19,99". None unless it's a sane amount."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        p = float(value)
+    elif isinstance(value, str):
+        s = re.sub(r"[^\d.,]", "", value)
+        s = s.replace(",", ".") if re.fullmatch(r"\d+,\d{1,2}", s) else s.replace(",", "")
+        try:
+            p = float(s)
+        except ValueError:
+            return None
+    else:
+        return None
+    return round(p, 2) if math.isfinite(p) and 0 < p < 1e9 else None
+
+
+def _ld_price(node, in_offer=False, depth=0):
+    """The first price inside an `offers` object anywhere in a JSON-LD tree."""
+    if depth > 40:
+        return None
+    if isinstance(node, dict):
+        if in_offer:
+            for key in ("price", "lowPrice"):
+                p = _price(node.get(key))
+                if p is not None:
+                    return p
+        children = [(v, in_offer or k in ("offers", "priceSpecification")) for k, v in node.items()]
+    elif isinstance(node, list):
+        children = [(v, in_offer) for v in node]
+    else:
+        return None
+    for child, offer in children:
+        p = _ld_price(child, offer, depth + 1)
+        if p is not None:
+            return p
+    return None
+
+
+def parse_preview(html, base_url):
+    """{title, price, image_url} from a page's Open Graph tags, JSON-LD and <title>."""
+    page = _PageMeta()
+    try:
+        page.feed(html)
+        page.close()
+    except Exception:  # noqa: BLE001 — keep whatever was collected before the parser gave up
+        pass
+    m = page.meta
+    title = " ".join((m.get("og:title") or m.get("twitter:title") or page.title).split())[:200] or None
+    price = None
+    for key in ("product:price:amount", "og:price:amount", "price"):
+        price = price or _price(m.get(key))
+    for block in page.ld:
+        if price is None:
+            try:
+                price = _ld_price(json.loads(block))
+            except (ValueError, RecursionError):
+                pass
+    image = None
+    for key in ("og:image:secure_url", "og:image", "og:image:url", "twitter:image", "twitter:image:src"):
+        if m.get(key):
+            candidate = urljoin(base_url, m[key])
+            if urlparse(candidate).scheme in ("http", "https"):
+                image = candidate
+                break
+    return {"title": title, "price": price, "image_url": image}
+
+
+def preview_image(url):
+    """Download a page's image and re-encode it like an upload, as a data: URL (the CSP allows
+    no other origins). None when that fails."""
+    if Image is None:
+        return None
+    try:
+        _url, _ctype, data = _fetch(url, "image/", PREVIEW_IMAGE_MAX)
+        img = Image.open(io.BytesIO(data), formats=PREVIEW_FORMATS)
+        img.load()
+        img = _flatten(img)
+    except PreviewError as exc:
+        app.logger.info("Link preview image skipped: %s", exc)
+        return None
+    except Exception:  # noqa: BLE001 — anything Pillow can't decode is "no image"
+        return None
+    buf = io.BytesIO()
+    _write_jpeg(img, buf, PHOTO_MAX)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@app.post("/api/preview")
+@editor_required
+def preview_link():
+    """Name, price and photo for a pasted link: {title, price, image}, null where unknown."""
+    url = clean_item_payload({"url": text(json_body(), "url")}, partial=True)["url"]
+    if not url:
+        abort(400, "Paste a link first.")
+    try:
+        final, ctype, body = _fetch(url, "text/html", PREVIEW_PAGE_MAX, truncate=True)
+    except PreviewError as exc:
+        app.logger.info("Link preview failed: %s", exc)
+        return jsonify(error="Couldn't read that page."), 502
+    charset = re.search(r"charset=[\"']?([\w.:-]+)", ctype, re.I)
+    try:
+        html = body.decode(charset.group(1) if charset else "utf-8", errors="replace")
+    except LookupError:
+        html = body.decode("utf-8", errors="replace")
+    found = parse_preview(html, final)
+    return jsonify(title=found["title"], price=found["price"],
+                   image=preview_image(found["image_url"]) if found["image_url"] else None)
 
 
 # ---------------------------------------------------------------- settings (editors)

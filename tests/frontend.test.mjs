@@ -11,7 +11,7 @@ const el = () => ({ hidden: false, textContent: "", innerHTML: "", value: "", ad
 const session = new Map();
 const nav = { reloads: 0 };
 const ctx = vm.createContext({
-  URL,
+  URL, atob, Blob,
   sessionStorage: {
     getItem: k => session.get(k) ?? null,
     setItem: (k, v) => session.set(k, String(v)),
@@ -27,9 +27,10 @@ const ctx = vm.createContext({
 });
 vm.runInContext(src, ctx, { filename: "app.js" });
 const { esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure, shouldRefresh,
-        visibleItems, occasionsIn, canAddIdea } =
+        visibleItems, occasionsIn, canAddIdea, linkFill, linkOfferLabel, dataUrlBlob } =
   vm.runInContext(`({ esc, money, host, inkFor, colorOf, SORTS, itemHTML, state, api, selectPerson, isAuthFailure,
-                      shouldRefresh, visibleItems, occasionsIn, canAddIdea })`, ctx);
+                      shouldRefresh, visibleItems, occasionsIn, canAddIdea, linkFill, linkOfferLabel,
+                      dataUrlBlob })`, ctx);
 
 const item = (over = {}) => ({
   id: 1, person_id: 1, name: "Thing", kind: "online", url: null, store: null, price: null, priority: 2,
@@ -315,4 +316,31 @@ test("a slow response for a tab you've left doesn't replace the tab you're on", 
   await first;
   assert.equal(state.person.name, "Sam");
   assert.equal(names(state.items), "for Sam");
+});
+
+test("link preview fills only fields that are still empty", () => {
+  const found = { title: "Orchid", price: 49.5, image: "data:image/jpeg;base64,AAAA" };
+  const empty = { name: "", price: "", hasPhoto: false };
+  assert.deepEqual({ ...linkFill(found, empty) }, { name: "Orchid", price: "49.50", image: found.image });
+  assert.deepEqual({ ...linkFill(found, { name: "My words", price: " 12 ", hasPhoto: true }) }, {});
+  assert.deepEqual({ ...linkFill(found, { ...empty, name: "  " }) }, { name: "Orchid", price: "49.50", image: found.image });
+  assert.deepEqual({ ...linkFill({ title: null, price: null, image: null }, empty) }, {});
+  assert.deepEqual({ ...linkFill(null, empty) }, {});
+  assert.deepEqual({ ...linkFill({ title: "", price: 0, image: null }, empty) }, { price: "0.00" });
+});
+
+test("link offer names what it would fill", () => {
+  assert.equal(linkOfferLabel({}), "");
+  assert.equal(linkOfferLabel({ price: "1.00" }), "Fill in price from the page");
+  assert.equal(linkOfferLabel({ name: "x", image: "data:" }), "Fill in name and photo from the page");
+  assert.equal(linkOfferLabel({ name: "x", price: "1.00", image: "data:" }), "Fill in name, price and photo from the page");
+});
+
+test("preview photos decode from data: URLs and nothing else", async () => {
+  const blob = dataUrlBlob("data:image/jpeg;base64," + Buffer.from([0xff, 0xd8, 0xff, 0x00]).toString("base64"));
+  assert.equal(blob.type, "image/jpeg");
+  assert.deepEqual([...new Uint8Array(await blob.arrayBuffer())], [0xff, 0xd8, 0xff, 0x00]);
+  assert.equal(dataUrlBlob("https://shop.example.com/a.jpg"), null);
+  assert.equal(dataUrlBlob("data:image/jpeg;base64,<script>"), null);
+  assert.equal(dataUrlBlob(null), null);
 });

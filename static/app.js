@@ -2,7 +2,8 @@
 
 const $ = (s, el = document) => el.querySelector(s);
 const state = { me: null, people: [], current: null, items: [], person: null, editing: null, buying: null,
-  photo: { blob: null, remove: false, previewUrl: null }, loadedAt: 0, refreshing: false,
+  photo: { blob: null, remove: false, previewUrl: null }, link: { url: null, ticket: 0, found: null },
+  loadedAt: 0, refreshing: false,
   view: "list", occasion: "" };
 
 const ICON = {
@@ -333,6 +334,7 @@ function openItemDialog(item) {
   }
   f.occasion.value = item ? item.occasion || "" : state.occasion;
   resetPhoto(item && item.thumb_url);
+  resetLink(item && item.url);
   // Suggest stores already used on any visible list
   const stores = [...new Set(state.items.map(i => i.store).filter(Boolean))];
   $("#storeList").innerHTML = stores.map(s => `<option value="${esc(s)}">`).join("");
@@ -384,6 +386,85 @@ async function saveItem(e) {
   finally { submit.disabled = false; }
 }
 
+// ------------------------------------------------------------ fill in from a link
+// What a link preview can fill in: only fields that are still empty, never what the user typed.
+function linkFill(found, form) {
+  const fill = {};
+  if (!found) return fill;
+  if (found.title && !form.name.trim()) fill.name = found.title;
+  if (found.price != null && !String(form.price).trim()) fill.price = Number(found.price).toFixed(2);
+  if (found.image && !form.hasPhoto) fill.image = found.image;
+  return fill;
+}
+
+function linkOfferLabel(fill) {
+  const parts = [fill.name && "name", fill.price && "price", fill.image && "photo"].filter(Boolean);
+  if (!parts.length) return "";
+  const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+  return `Fill in ${list} from the page`;
+}
+
+// The server sends the photo as a data: URL; the CSP keeps fetch() away from those, so decode it here.
+function dataUrlBlob(url) {
+  const m = /^data:([\w/+.-]+);base64,([A-Za-z0-9+/=]*)$/.exec(url || "");
+  if (!m) return null;
+  const bin = atob(m[2]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: m[1] });
+}
+
+function formFields(f) {
+  return { name: f.name.value, price: f.price.value, hasPhoto: !!state.photo.previewUrl };
+}
+
+function resetLink(existingUrl) {
+  state.link = { url: existingUrl || null, ticket: state.link.ticket + 1, found: null };
+  $("#linkOffer").hidden = true;
+}
+
+function renderLinkOffer() {
+  const label = linkOfferLabel(linkFill(state.link.found, formFields($("#itemForm"))));
+  $("#linkFill").textContent = label;
+  $("#linkFill").hidden = !label;
+  $("#linkStatus").textContent = "";
+  $("#linkOffer").hidden = !label;
+}
+
+// After a link is pasted, ask the server what the page says. Failing is normal (many shops
+// block it), so errors just leave the form as it is.
+async function lookUpLink() {
+  const f = $("#itemForm");
+  const url = f.url.value.trim();
+  if (!isEditor() || f.kind.value !== "online" || !url || url === state.link.url) return;
+  const ticket = ++state.link.ticket;
+  state.link.url = url;
+  state.link.found = null;
+  $("#linkFill").hidden = true;
+  $("#linkStatus").textContent = "Looking at the page…";
+  $("#linkOffer").hidden = false;
+  let found = null;
+  try { found = await api("/api/preview", { method: "POST", body: { url } }); } catch { /* silent */ }
+  if (ticket !== state.link.ticket || !$("#itemDlg").open) return; // the link or dialog moved on
+  state.link.found = found;
+  renderLinkOffer();
+}
+
+function fillFromLink() {
+  const f = $("#itemForm");
+  const fill = linkFill(state.link.found, formFields(f));
+  if (fill.name) f.name.value = fill.name;
+  if (fill.price) f.price.value = fill.price;
+  const blob = fill.image && dataUrlBlob(fill.image);
+  if (blob) {
+    state.photo.blob = blob;
+    state.photo.remove = false;
+    setPreview(URL.createObjectURL(blob));
+    $("#photoHint").textContent = "Photo from the link will be saved with the item.";
+  }
+  $("#linkOffer").hidden = true;
+}
+
 // ------------------------------------------------------------ item photos
 const PHOTO_HINT = "Take a picture or choose one. On a computer you can also paste or drop a screenshot here.";
 
@@ -395,6 +476,7 @@ function setPreview(url) {
   if (url) img.src = url; else img.removeAttribute("src");
   $("#photoPick").textContent = url ? "Change photo" : "Add photo";
   $("#photoRemove").hidden = !url;
+  if (state.link.found) renderLinkOffer();
 }
 
 function resetPhoto(existingUrl) {
@@ -626,7 +708,15 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#items").addEventListener("click", onListClick);
   $("#addBtn").addEventListener("click", () => state.person ? openItemDialog(null) : openSettings());
   $("#itemForm").addEventListener("submit", saveItem);
-  $("#itemForm").addEventListener("change", e => { if (e.target.name === "kind") setKind(e.currentTarget, e.target.value); });
+  $("#itemForm").addEventListener("change", e => {
+    if (e.target.name === "kind") setKind(e.currentTarget, e.target.value);
+    if (e.target.name === "url") lookUpLink();
+  });
+  $("#itemForm").addEventListener("input", e => {
+    if (e.target.name === "url" && e.inputType === "insertFromPaste") lookUpLink();
+    else if (state.link.found) renderLinkOffer(); // the offer only lists fields that are still empty
+  });
+  $("#linkFill").addEventListener("click", fillFromLink);
   $("#buyForm").addEventListener("submit", saveBuy);
   // photos: picker, paste, drag-and-drop, viewer
   $("#photoPick").addEventListener("click", () => $("#photoInput").click());
@@ -650,7 +740,7 @@ document.addEventListener("DOMContentLoaded", () => {
     form.classList.remove("dragging");
     takePhoto(imageFrom(e.dataTransfer));
   });
-  $("#itemDlg").addEventListener("close", () => setPreview(null));
+  $("#itemDlg").addEventListener("close", () => { setPreview(null); resetLink(null); });
   $("#photoDlg").addEventListener("click", () => $("#photoDlg").close());
   $("#settingsBtn").addEventListener("click", () => openSettings().catch(err => toast(err.message)));
   $("#setDlg").addEventListener("click", onSettingsClick);
