@@ -1,6 +1,6 @@
 # Runtime (on Alpine these come from apk: py3-flask py3-gunicorn py3-jwt py3-cryptography py3-pillow)
 flask>=3.0
-gunicorn>=21
+gunicorn>=26.2.0
 pyjwt[crypto]>=2.8
 pillow>=10
 
