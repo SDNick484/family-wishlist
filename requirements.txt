@@ -2,7 +2,7 @@
 flask>=3.0
 gunicorn>=21
 pyjwt[crypto]>=2.8
-pillow>=10
+pillow>=13.0.0
 
 # Tests
 pytest>=8
