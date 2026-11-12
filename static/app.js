@@ -2,7 +2,8 @@
 
 const $ = (s, el = document) => el.querySelector(s);
 const state = { me: null, people: [], current: null, items: [], person: null, editing: null, buying: null,
-  photo: { blob: null, remove: false, previewUrl: null }, loadedAt: 0, refreshing: false };
+  photo: { blob: null, remove: false, previewUrl: null }, loadedAt: 0, refreshing: false,
+  view: "list", occasion: "" };
 
 const ICON = {
   link: '<svg viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
@@ -71,6 +72,10 @@ function toast(msg) {
 }
 
 const isEditor = () => state.me && state.me.role === "editor";
+const canEdit = i => isEditor() || i.my_idea;
+// Signed-in people can leave secret ideas on someone else's tab. LAN users have no identity,
+// so they could be looking at their own tab: the server refuses them.
+const canAddIdea = p => !!(state.me && state.me.email && p && !p.is_me);
 
 // ------------------------------------------------------------ per-person colors
 const DEFAULT_COLOR = "#1f4d3a";
@@ -105,7 +110,6 @@ async function boot() {
   }
   $("#me").textContent = `${state.me.name} · ${isEditor() ? "can edit" : "can check off"}`;
   $("#settingsBtn").hidden = !isEditor();
-  $("#addBtn").hidden = !isEditor();
   $("#logout").hidden = state.me.source !== "cloudflare";
   $("#sort").value = store.get("wl.sort") || "manual";
   $("#showBought").checked = store.get("wl.showBought") !== "0";
@@ -125,8 +129,9 @@ async function selectPerson(id) {
   state.current = id;
   store.set("wl.tab", String(id));
   renderTabs();
-  const data = await api(`/api/people/${id}/items`);
-  if (state.current !== id) return; // another tab was picked while this one loaded
+  const view = state.view;
+  const data = await api(`/api/people/${id}/${view === "history" ? "history" : "items"}`);
+  if (state.current !== id || state.view !== view) return; // the user moved on while this loaded
   state.person = data.person;
   state.items = data.items;
   renderItems();
@@ -173,10 +178,28 @@ const SORTS = {
                    (a.store || host(a.url)).localeCompare(b.store || host(b.url)),
 };
 
+const occasionsIn = items => [...new Set(items.map(i => i.occasion).filter(Boolean))]
+  .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+// No sortKey keeps the server's order (History comes newest first).
+function visibleItems(items, { sortKey, showBought = true, occasion = "" }) {
+  let out = sortKey ? [...items].sort(SORTS[sortKey] || SORTS.manual) : [...items];
+  out.sort((a, b) => a.purchased - b.purchased); // stable: purchased sink to bottom
+  if (!showBought) out = out.filter(i => !i.purchased);
+  if (occasion) out = out.filter(i => i.occasion === occasion);
+  return out;
+}
+
 function renderItems() {
   const ul = $("#items"), empty = $("#empty");
   const p = state.person;
-  $("#ownerNote").hidden = !(p && p.is_me);
+  const history = state.view === "history";
+  $("#ownerNote").hidden = !(p && p.is_me) || history;
+  $("#historyBtn").hidden = !p;
+  $("#historyBtn").textContent = history ? "Back to list" : "History";
+  $("#sort").hidden = $("#showBoughtLabel").hidden = history;
+  $("#addBtn").hidden = history || !(isEditor() || canAddIdea(p));
+  $("#addLabel").textContent = isEditor() ? "Add item" : "Add idea";
 
   if (!p) {
     ul.innerHTML = "";
@@ -186,26 +209,39 @@ function renderItems() {
     return;
   }
 
+  const occasions = occasionsIn(state.items);
+  if (!occasions.includes(state.occasion)) state.occasion = "";
+  const filter = $("#occasion");
+  filter.hidden = !occasions.length;
+  filter.innerHTML = '<option value="">All occasions</option>' + occasions.map(o =>
+    `<option value="${esc(o)}"${o === state.occasion ? " selected" : ""}>${esc(o)}</option>`).join("");
+
   const sortKey = $("#sort").value;
-  const showBought = $("#showBought").checked;
-  let items = [...state.items].sort(SORTS[sortKey] || SORTS.manual);
-  items.sort((a, b) => a.purchased - b.purchased); // stable: purchased sink to bottom
-  if (!showBought) items = items.filter(i => !i.purchased);
+  const items = history ? visibleItems(state.items, { occasion: state.occasion })
+    : visibleItems(state.items, { sortKey, showBought: $("#showBought").checked, occasion: state.occasion });
 
   const total = state.items.length;
   const bought = state.items.filter(i => i.purchased).length;
+  const reserved = state.items.filter(i => !i.purchased && i.reserved_by).length;
   const remaining = state.items.filter(i => !i.purchased).reduce((s, i) => s + (i.price || 0), 0);
-  $("#summary").innerHTML = p.is_me
-    ? `<b>${total}</b> item${total === 1 ? "" : "s"} on your list`
-    : `<b>${total - bought}</b> still wanted · <b>${bought}</b> purchased${remaining ? ` · ${money(remaining)} to go` : ""}`;
+  $("#summary").innerHTML = history ? `<b>${total}</b> gift${total === 1 ? "" : "s"} given`
+    : p.is_me ? `<b>${total}</b> item${total === 1 ? "" : "s"} on your list`
+    : `<b>${total - bought}</b> still wanted${reserved ? ` · <b>${reserved}</b> reserved` : ""} · ` +
+      `<b>${bought}</b> purchased${remaining ? ` · ${money(remaining)} to go` : ""}`;
+  $("#archiveAllBtn").hidden = history || !isEditor() || p.is_me || !bought;
 
-  const canMove = isEditor() && sortKey === "manual";
+  // Moving swaps with the next item on the server, which a filter could be hiding.
+  const canMove = !history && isEditor() && sortKey === "manual" && !state.occasion;
   ul.innerHTML = items.map(i => itemHTML(i, canMove)).join("");
 
   empty.hidden = items.length > 0;
   if (!items.length) {
-    empty.textContent = total ? "Everything on this list has been purchased."
-      : isEditor() ? `Nothing on ${p.name}'s list yet. Tap “Add item”.` : `Nothing on ${p.name}'s list yet.`;
+    empty.textContent = history
+      ? (p.is_me ? "Gifts you've been given show up here once they're archived." : `Nothing archived for ${p.name} yet.`)
+      : total ? "Everything on this list has been purchased."
+      : isEditor() ? `Nothing on ${p.name}'s list yet. Tap “Add item”.`
+      : canAddIdea(p) ? `Nothing on ${p.name}'s list yet. Tap “Add idea” to suggest something only others can see.`
+      : `Nothing on ${p.name}'s list yet.`;
   }
 }
 
@@ -218,36 +254,49 @@ function itemHTML(i, canMove) {
     ? `<span class="where">${ICON.link}${esc(host(i.url) || "Online")}</span>`
     : `<span class="where">${ICON.store}${esc(i.store || "In store")}</span>`;
   const stars = `<span class="stars" title="Priority">${"★".repeat(4 - i.priority)}</span>`;
+  const tags = (i.occasion ? `<span class="tag">${esc(i.occasion)}</span>` : "") +
+    (i.secret ? `<span class="idea">Secret idea from ${esc(i.created_by || "someone")}</span>` : "") +
+    (i.removed_by_owner ? `<span class="removed">Removed from list after ${i.purchased ? "purchase" : "it was reserved"}</span>` : "");
 
+  const btn = (act, label, cls = "btn small") => `<button class="${cls}" data-act="${act}" data-id="${i.id}">${label}</button>`;
   const acts = [];
   let got = "";
-  if (!p.is_me) {
+  if (i.archived_at) {
+    // Archiving ends the surprise, so the giver shows on the owner's own tab too.
+    got = `<div class="got">${ICON.check}Given by ${esc(i.purchased_by)} · ${day(i.purchased_at)}</div>`;
+    if (isEditor() && !p.is_me) acts.push(btn("restore", "Restore"));
+  } else if (!p.is_me) {
     if (i.purchased) {
       got = `<div class="got">${ICON.check}Got by ${esc(i.purchased_by)} · ${day(i.purchased_at)}</div>`;
-      if (i.mine || isEditor()) acts.push(`<button class="btn small" data-act="unbuy" data-id="${i.id}">Undo purchase</button>`);
+      if (i.mine || isEditor()) acts.push(btn("unbuy", "Undo purchase"));
+      if (isEditor()) acts.push(btn("archive", "Archive"));
+    } else if (i.reserved_by) {
+      got = `<div class="got reserved">Reserved by ${esc(i.reserved_by)} · ${day(i.reserved_at)}</div>`;
+      if (i.reserved_mine) acts.push(btn("buy", "Mark purchased", "btn buy"));
+      if (i.reserved_mine || isEditor()) acts.push(btn("release", "Release"));
     } else {
-      acts.push(`<button class="btn buy" data-act="buy" data-id="${i.id}">Mark purchased</button>`);
+      acts.push(btn("buy", "Mark purchased", "btn buy"), btn("reserve", "Reserve"));
     }
   }
   acts.push('<span class="spacer"></span>');
-  if (isEditor()) {
-    if (canMove && !i.purchased) {
-      acts.push(`<button class="btn small" data-act="up" data-id="${i.id}" aria-label="Move up">↑</button>`);
-      acts.push(`<button class="btn small" data-act="down" data-id="${i.id}" aria-label="Move down">↓</button>`);
-    }
-    acts.push(`<button class="btn small" data-act="edit" data-id="${i.id}">Edit</button>`);
-    acts.push(`<button class="btn small danger" data-act="del" data-id="${i.id}">Delete</button>`);
+  if (isEditor() && canMove && !i.purchased) {
+    acts.push(`<button class="btn small" data-act="up" data-id="${i.id}" aria-label="Move up">↑</button>`);
+    acts.push(`<button class="btn small" data-act="down" data-id="${i.id}" aria-label="Move down">↓</button>`);
+  }
+  if (canEdit(i)) {
+    if (!i.archived_at) acts.push(btn("edit", "Edit"));
+    acts.push(btn("del", "Delete", "btn small danger"));
   }
 
   const thumb = i.thumb_url
     ? `<button class="thumb" data-act="photo" data-id="${i.id}" aria-label="View photo of ${esc(i.name)}"><img src="${esc(i.thumb_url)}" alt="" loading="lazy"></button>`
     : "";
 
-  return `<li class="item${i.purchased ? " bought" : ""}${thumb ? " has-photo" : ""}">
+  return `<li class="item${i.purchased ? " bought" : ""}${i.secret ? " secret" : ""}${thumb ? " has-photo" : ""}">
     ${thumb}
     <div class="name">${name}</div>
     <div class="price${i.price == null ? " none" : ""}">${i.price == null ? "no price" : money(i.price)}</div>
-    <div class="meta">${where}${stars}${i.removed_by_owner ? '<span class="removed">Removed from list after purchase</span>' : ""}</div>
+    <div class="meta">${where}${stars}${tags}</div>
     ${i.notes ? `<p class="notes">${esc(i.notes)}</p>` : ""}
     ${got}
     <div class="item-actions">${acts.join("")}</div>
@@ -265,7 +314,12 @@ function openItemDialog(item) {
   f.reset();
   $("#itemErr").textContent = "";
   state.editing = item || null;
-  $("#itemDlgTitle").textContent = item ? "Edit item" : `Add to ${state.person.name}'s list`;
+  const name = state.person.name;
+  $("#itemDlgTitle").textContent = item ? "Edit item" : isEditor() ? `Add to ${name}'s list` : `Gift idea for ${name}`;
+  // New items only. Shoppers can only add secret ideas, so it's always ticked for them.
+  $("#secretRow").hidden = !!item || !canAddIdea(state.person);
+  $("#secretWho").textContent = name;
+  f.secret.checked = f.secret.disabled = !isEditor();
   const kind = item ? item.kind : (store.get("wl.kind") || "online");
   f.kind.value = kind;
   setKind(f, kind);
@@ -277,10 +331,14 @@ function openItemDialog(item) {
     f.priority.value = String(item.priority);
     f.notes.value = item.notes || "";
   }
+  f.occasion.value = item ? item.occasion || "" : state.occasion;
   resetPhoto(item && item.thumb_url);
   // Suggest stores already used on any visible list
   const stores = [...new Set(state.items.map(i => i.store).filter(Boolean))];
   $("#storeList").innerHTML = stores.map(s => `<option value="${esc(s)}">`).join("");
+  api("/api/occasions").then(list => {
+    $("#occasionList").innerHTML = list.map(o => `<option value="${esc(o)}">`).join("");
+  }).catch(() => { /* suggestions are optional */ });
   $("#itemDlg").showModal();
   f.name.focus();
 }
@@ -293,14 +351,15 @@ async function saveItem(e) {
     name: f.name.value, kind,
     url: kind === "online" ? f.url.value : "",
     store: kind === "store" ? f.store.value : "",
-    price: f.price.value, priority: f.priority.value, notes: f.notes.value,
+    price: f.price.value, priority: f.priority.value, notes: f.notes.value, occasion: f.occasion.value,
   };
+  const secret = !state.editing && !$("#secretRow").hidden && f.secret.checked;
   const submit = f.querySelector('button[type="submit"]');
   submit.disabled = true;
   try {
     const saved = state.editing
       ? await api(`/api/items/${state.editing.id}`, { method: "PATCH", body })
-      : await api(`/api/people/${state.person.id}/items`, { method: "POST", body });
+      : await api(`/api/people/${state.person.id}/${secret ? "ideas" : "items"}`, { method: "POST", body });
     try {
       if (state.photo.blob) {
         $("#photoHint").textContent = "Uploading photo…";
@@ -400,14 +459,20 @@ function openPhoto(item) {
   $("#photoDlg").showModal();
 }
 
-// ------------------------------------------------------------ purchase dialog
-function openBuyDialog(item) {
-  state.buying = item;
+// ------------------------------------------------------------ purchase / reserve dialog
+function openBuyDialog(item, mode = "buy") {
+  const reserve = mode === "reserve";
+  state.buying = { item, reserve };
   const f = $("#buyForm");
   f.reset();
   $("#buyErr").textContent = "";
-  $("#buyWhat").textContent = `${item.name} for ${state.person.name}`;
-  f.by.value = store.get("wl.buyer") || (state.me.source === "lan" ? "" : state.me.name);
+  $("#buyTitle").textContent = reserve ? "Reserve" : "Mark as purchased";
+  $("#buyLabel").textContent = reserve ? "Who's getting it?" : "Who got it?";
+  $("#buySubmit").textContent = reserve ? "Reserve" : "Mark purchased";
+  $("#buyWhat").textContent = `${item.name} for ${state.person.name}` +
+    (reserve ? ". Others will see it's taken until you mark it purchased or release it." : "");
+  f.by.value = (item.reserved_mine && item.reserved_by) || store.get("wl.buyer") ||
+    (state.me.source === "lan" ? "" : state.me.name);
   $("#buyDlg").showModal();
   f.by.focus(); f.by.select();
 }
@@ -415,13 +480,27 @@ function openBuyDialog(item) {
 async function saveBuy(e) {
   e.preventDefault();
   const by = e.target.by.value.trim();
+  const { item, reserve } = state.buying;
   try {
-    await api(`/api/items/${state.buying.id}/purchase`, { method: "POST", body: { purchased: true, by } });
+    await api(`/api/items/${item.id}/${reserve ? "reserve" : "purchase"}`,
+              { method: "POST", body: reserve ? { reserved: true, by } : { purchased: true, by } });
     if (state.me.source === "lan") store.set("wl.buyer", by);
     $("#buyDlg").close();
-    toast("Marked as purchased");
+    toast(reserve ? "Reserved" : "Marked as purchased");
     await refresh();
   } catch (err) { $("#buyErr").textContent = err.message; }
+}
+
+async function archiveAll() {
+  const p = state.person;
+  const n = state.items.filter(i => i.purchased).length;
+  if (!confirm(`Move the ${n} purchased item${n === 1 ? "" : "s"} on ${p.name}'s list to History? ` +
+               `${p.name} will be able to see them there, including who gave them.`)) return;
+  try {
+    await api(`/api/people/${p.id}/archive`, { method: "POST", body: {} });
+    toast("Moved to History");
+    await refresh();
+  } catch (err) { toast(err.message); }
 }
 
 // ------------------------------------------------------------ list actions
@@ -433,11 +512,21 @@ async function onListClick(e) {
   try {
     switch (b.dataset.act) {
       case "buy": return openBuyDialog(item);
+      case "reserve": return openBuyDialog(item, "reserve");
       case "photo": return openPhoto(item);
       case "edit": return openItemDialog(item);
       case "unbuy":
         if (!confirm(`Undo "${item.name}" being purchased by ${item.purchased_by}?`)) return;
         await api(`/api/items/${item.id}/purchase`, { method: "POST", body: { purchased: false } });
+        break;
+      case "release":
+        if (!confirm(item.reserved_mine ? `Release "${item.name}" so someone else can get it?`
+          : `Release ${item.reserved_by}'s reservation of "${item.name}"?`)) return;
+        await api(`/api/items/${item.id}/reserve`, { method: "POST", body: { reserved: false } });
+        break;
+      case "archive": case "restore":
+        await api(`/api/items/${item.id}/archive`, { method: "POST", body: { archived: b.dataset.act === "archive" } });
+        toast(b.dataset.act === "archive" ? "Moved to History" : "Back on the list");
         break;
       case "del":
         if (!confirm(`Delete "${item.name}"?`)) return;
@@ -528,6 +617,12 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("#sort").addEventListener("change", e => { store.set("wl.sort", e.target.value); renderItems(); });
   $("#showBought").addEventListener("change", e => { store.set("wl.showBought", e.target.checked ? "1" : "0"); renderItems(); });
+  $("#occasion").addEventListener("change", e => { state.occasion = e.target.value; renderItems(); });
+  $("#historyBtn").addEventListener("click", () => {
+    state.view = state.view === "history" ? "list" : "history";
+    if (state.current) selectPerson(state.current).catch(err => toast(err.message));
+  });
+  $("#archiveAllBtn").addEventListener("click", archiveAll);
   $("#items").addEventListener("click", onListClick);
   $("#addBtn").addEventListener("click", () => state.person ? openItemDialog(null) : openSettings());
   $("#itemForm").addEventListener("submit", saveItem);

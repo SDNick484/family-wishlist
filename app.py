@@ -20,6 +20,7 @@ import warnings
 import re
 import sqlite3
 import time
+from collections import Counter
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -101,7 +102,14 @@ CREATE TABLE IF NOT EXISTS items (
   purchased_by_email TEXT,
   purchased_at INTEGER,
   removed_by_owner INTEGER NOT NULL DEFAULT 0,
-  photo_ver INTEGER
+  photo_ver INTEGER,
+  secret INTEGER NOT NULL DEFAULT 0,
+  created_by_email TEXT,
+  reserved_by TEXT,
+  reserved_by_email TEXT,
+  reserved_at INTEGER,
+  occasion TEXT,
+  archived_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS items_person ON items(person_id);
 """
@@ -127,7 +135,11 @@ def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     # Upgrade databases created by earlier releases.
-    for table, col, decl in (("people", "color", "TEXT"), ("items", "photo_ver", "INTEGER")):
+    for table, col, decl in (("people", "color", "TEXT"), ("items", "photo_ver", "INTEGER"),
+                             ("items", "secret", "INTEGER NOT NULL DEFAULT 0"),
+                             ("items", "created_by_email", "TEXT"), ("items", "reserved_by", "TEXT"),
+                             ("items", "reserved_by_email", "TEXT"), ("items", "reserved_at", "INTEGER"),
+                             ("items", "occasion", "TEXT"), ("items", "archived_at", "INTEGER")):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if cols and col not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -261,23 +273,56 @@ def get_person(pid):
     return row
 
 
+def can_see(item, owner):
+    """Whether the user may know this item exists; `owner` says whether its tab is theirs.
+
+    Every route reaches items through this, so a hidden item answers exactly like a missing one.
+    """
+    if owner and item["removed_by_owner"]:
+        return False
+    if item["secret"]:
+        # Secret ideas need an identity (LAN users could be the owner) and stay hidden from
+        # the owner until the gift has been given and archived.
+        return bool(g.user["email"]) and not (owner and not item["archived_at"])
+    return True
+
+
 def get_item(iid):
     row = db().execute("SELECT * FROM items WHERE id = ?", (iid,)).fetchone()
-    if not row:
+    if not row or not can_see(row, is_owner(get_person(row["person_id"]))):
         abort(404, "No such item.")
     return row
 
 
+def tab_items(person, archived=False):
+    """The items on a tab this user can see: the list itself, or its archived gifts."""
+    q = "SELECT * FROM items WHERE person_id = ? AND archived_at IS " + ("NOT NULL" if archived else "NULL")
+    owner = is_owner(person)
+    return [r for r in db().execute(q + " ORDER BY position, id", (person["id"],)) if can_see(r, owner)]
+
+
+def require_edit(item):
+    """Editors can change any item; whoever added a secret idea can change that idea."""
+    em = g.user["email"]
+    if g.user["role"] != "editor" and not (em and item["secret"] and item["created_by_email"] == em):
+        abort(403, "Only editors can do that.")
+
+
 def item_json(row, owner_view):
-    d = {k: row[k] for k in ("id", "person_id", "name", "kind", "url", "store", "price",
-                             "priority", "notes", "position", "created_at", "created_by")}
-    if owner_view:  # keep the surprise: owners never see purchase state
+    em = g.user["email"]
+    d = {k: row[k] for k in ("id", "person_id", "name", "kind", "url", "store", "price", "priority",
+                             "notes", "occasion", "position", "created_at", "created_by", "archived_at")}
+    if owner_view and not row["archived_at"]:  # keep the surprise until the gift is archived
         d.update(purchased=False, purchased_by=None, purchased_at=None, mine=False,
-                 removed_by_owner=False)
+                 removed_by_owner=False, secret=False, my_idea=False,
+                 reserved_by=None, reserved_at=None, reserved_mine=False)
     else:
         d.update(purchased=bool(row["purchased"]), purchased_by=row["purchased_by"],
                  purchased_at=row["purchased_at"], removed_by_owner=bool(row["removed_by_owner"]),
-                 mine=bool(g.user["email"] and row["purchased_by_email"] == g.user["email"]))
+                 mine=bool(em and row["purchased_by_email"] == em),
+                 secret=bool(row["secret"]), my_idea=bool(em and row["secret"] and row["created_by_email"] == em),
+                 reserved_by=row["reserved_by"], reserved_at=row["reserved_at"],
+                 reserved_mine=bool(em and row["reserved_by_email"] == em))
     ver = row["photo_ver"]
     d["photo_url"] = f"/photos/{row['id']}/full?v={ver}" if ver else None
     d["thumb_url"] = f"/photos/{row['id']}/thumb?v={ver}" if ver else None
@@ -369,6 +414,8 @@ def clean_item_payload(data, partial=False):
         out["priority"] = min(3, max(1, pr))
     if "notes" in data:
         out["notes"] = text(data, "notes")[:1000] or None
+    if "occasion" in data:
+        out["occasion"] = text(data, "occasion")[:60] or None
     return out
 
 
@@ -399,14 +446,16 @@ def list_people():
     out = []
     for r in rows:
         owner = is_owner(r)
-        stats = db().execute(
-            "SELECT COUNT(*) n, SUM(purchased) bought, "
-            "SUM(CASE WHEN purchased = 0 THEN COALESCE(price,0) ELSE 0 END) remaining "
-            "FROM items WHERE person_id = ? AND removed_by_owner = 0", (r["id"],)).fetchone()
+        # Counts leave out what the owner removed, for everyone: it's no longer on their list.
+        listed = [i for i in tab_items(r) if not i["removed_by_owner"]]
+        archived = [i for i in tab_items(r, archived=True) if not i["removed_by_owner"]]
         d = {"id": r["id"], "name": r["name"], "color": r["color"], "is_me": owner,
-             "count": stats["n"] or 0}
+             "count": len(listed), "archived": len(archived)}
         if not owner:
-            d.update(bought=stats["bought"] or 0, remaining=round(stats["remaining"] or 0, 2))
+            open_ = [i for i in listed if not i["purchased"]]
+            d.update(bought=len(listed) - len(open_),
+                     reserved=sum(1 for i in open_ if i["reserved_by"] is not None),
+                     remaining=round(sum(i["price"] or 0 for i in open_), 2))
         if g.user["role"] == "editor":
             d["owner_email"] = r["owner_email"]
         out.append(d)
@@ -417,35 +466,65 @@ def list_people():
 def list_items(pid):
     person = get_person(pid)
     owner = is_owner(person)
-    q = "SELECT * FROM items WHERE person_id = ?"
-    if owner:
-        q += " AND removed_by_owner = 0"
-    rows = db().execute(q + " ORDER BY position, id", (pid,)).fetchall()
+    return jsonify({"person": {"id": person["id"], "name": person["name"], "is_me": owner},
+                    "items": [item_json(r, owner) for r in tab_items(person)]})
+
+
+@app.get("/api/people/<int:pid>/history")
+def list_history(pid):
+    """Archived gifts, newest first. Archiving ends the surprise, so the owner sees the givers."""
+    person = get_person(pid)
+    owner = is_owner(person)
+    rows = sorted(tab_items(person, archived=True), key=lambda r: (-r["archived_at"], r["id"]))
     return jsonify({"person": {"id": person["id"], "name": person["name"], "is_me": owner},
                     "items": [item_json(r, owner) for r in rows]})
+
+
+@app.get("/api/occasions")
+def list_occasions():
+    """Occasion tags on items this user can see, most used first: suggestions for the item form."""
+    rows = db().execute("SELECT items.*, people.owner_email FROM items JOIN people ON people.id = person_id "
+                        "WHERE occasion IS NOT NULL")
+    used = Counter(r["occasion"] for r in rows if can_see(r, is_owner(r)))
+    return jsonify(sorted(used, key=lambda o: (-used[o], o.lower())))
+
+
+def insert_item(pid, data, secret=False):
+    data.setdefault("priority", 2)
+    pos = db().execute("SELECT COALESCE(MAX(position), -1) + 1 FROM items WHERE person_id = ?",
+                       (pid,)).fetchone()[0]
+    cur = db().execute(
+        "INSERT INTO items (person_id, name, kind, url, store, price, priority, notes, occasion, position, "
+        "created_at, created_by, created_by_email, secret) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (pid, data["name"], data["kind"], data.get("url"), data.get("store"), data.get("price"),
+         data["priority"], data.get("notes"), data.get("occasion"), pos, int(time.time()),
+         g.user["name"], g.user["email"], int(secret)))
+    db().commit()
+    return jsonify(item_json(get_item(cur.lastrowid), is_owner(get_person(pid)))), 201
 
 
 @app.post("/api/people/<int:pid>/items")
 @editor_required
 def add_item(pid):
     get_person(pid)
-    data = clean_item_payload(json_body())
-    data.setdefault("priority", 2)
-    pos = db().execute("SELECT COALESCE(MAX(position), -1) + 1 FROM items WHERE person_id = ?",
-                       (pid,)).fetchone()[0]
-    cur = db().execute(
-        "INSERT INTO items (person_id, name, kind, url, store, price, priority, notes, position, "
-        "created_at, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (pid, data["name"], data["kind"], data.get("url"), data.get("store"), data.get("price"),
-         data["priority"], data.get("notes"), pos, int(time.time()), g.user["name"]))
-    db().commit()
-    return jsonify(item_json(get_item(cur.lastrowid), is_owner(get_person(pid)))), 201
+    return insert_item(pid, clean_item_payload(json_body()))
+
+
+@app.post("/api/people/<int:pid>/ideas")
+def add_idea(pid):
+    """A secret gift idea: anyone signed in can add one to someone else's tab."""
+    person = get_person(pid)
+    if not g.user["email"]:
+        abort(403, "Sign in to add secret ideas.")
+    if is_owner(person):
+        abort(403, "Secret ideas are for other people's lists.")
+    return insert_item(pid, clean_item_payload(json_body()), secret=True)
 
 
 @app.patch("/api/items/<int:iid>")
-@editor_required
 def edit_item(iid):
     item = get_item(iid)
+    require_edit(item)
     data = clean_item_payload(json_body(), partial=True)
     if data:
         sets = ", ".join(f"{k} = ?" for k in data)
@@ -455,11 +534,11 @@ def edit_item(iid):
 
 
 @app.delete("/api/items/<int:iid>")
-@editor_required
 def delete_item(iid):
     item = get_item(iid)
-    if is_owner(get_person(item["person_id"])) and item["purchased"]:
-        # Already bought for them: hide from the owner instead of erasing the buyer's record.
+    require_edit(item)
+    if is_owner(get_person(item["person_id"])) and (item["purchased"] or item["reserved_by"] is not None):
+        # Already bought or reserved for them: hide from the owner instead of erasing the record.
         db().execute("UPDATE items SET removed_by_owner = 1 WHERE id = ?", (iid,))
     else:
         db().execute("DELETE FROM items WHERE id = ?", (iid,))
@@ -472,13 +551,15 @@ def delete_item(iid):
 @editor_required
 def move_item(iid):
     item = get_item(iid)
+    if item["archived_at"]:
+        abort(400, "Archived items aren't on the list. Restore it first.")
     direction = json_body().get("dir")
-    rows = db().execute("SELECT id, removed_by_owner FROM items WHERE person_id = ? ORDER BY position, id",
+    rows = db().execute("SELECT * FROM items WHERE person_id = ? AND archived_at IS NULL ORDER BY position, id",
                         (item["person_id"],)).fetchall()
     ids = [r["id"] for r in rows]
-    # Swap with the neighbor the user can see: the owner's view leaves out removed items.
+    # Swap with the neighbor the user can see: the owner's view leaves out removed items and secret ideas.
     owner = is_owner(get_person(item["person_id"]))
-    seen = [n for n, r in enumerate(rows) if r["id"] == iid or not (owner and r["removed_by_owner"])]
+    seen = [n for n, r in enumerate(rows) if can_see(r, owner)]
     k = seen.index(ids.index(iid))
     k2 = k - 1 if direction == "up" else k + 1
     if 0 <= k2 < len(seen):
@@ -490,22 +571,36 @@ def move_item(iid):
     return jsonify(ok=True)
 
 
-@app.post("/api/items/<int:iid>/purchase")
-def purchase(iid):
+def shopper_item(iid):
+    """An item someone may buy or reserve: not on their own tab, and not archived."""
     item = get_item(iid)
     if is_owner(get_person(item["person_id"])):
         abort(403, "That's your own list — no peeking!")
+    if item["archived_at"]:
+        abort(400, "That gift has been archived. Restore it to the list first.")
+    return item
+
+
+@app.post("/api/items/<int:iid>/purchase")
+def purchase(iid):
+    item = shopper_item(iid)
     data = json_body()
+    em = g.user["email"]
     if data.get("purchased", True):
         who = text(data, "by")[:80] or g.user["name"]
-        # Claim it in one statement so two shoppers tapping at once can't both succeed.
+        # Claim it in one statement so two shoppers tapping at once can't both succeed. Someone
+        # else's reservation blocks it; buying ends the reservation.
         cur = db().execute("UPDATE items SET purchased = 1, purchased_by = ?, purchased_by_email = ?, "
-                           "purchased_at = ? WHERE id = ? AND purchased = 0",
-                           (who, g.user["email"], int(time.time()), iid))
+                           "purchased_at = ?, reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
+                           "WHERE id = ? AND purchased = 0 AND (reserved_by IS NULL OR reserved_by_email = ?)",
+                           (who, em, int(time.time()), iid, em))
         if cur.rowcount == 0:
-            abort(400, f"Already marked as purchased by {get_item(iid)['purchased_by']}.")
+            now = get_item(iid)
+            if now["purchased"]:
+                abort(400, f"Already marked as purchased by {now['purchased_by']}.")
+            abort(400, f"{now['reserved_by']} has reserved this. Only they can mark it purchased.")
     else:
-        mine = g.user["email"] and item["purchased_by_email"] == g.user["email"]
+        mine = em and item["purchased_by_email"] == em
         if not (mine or g.user["role"] == "editor"):
             abort(403, "Only the person who marked it (or an editor) can undo that.")
         if item["removed_by_owner"]:
@@ -518,6 +613,69 @@ def purchase(iid):
                      "purchased_at = NULL WHERE id = ?", (iid,))
     db().commit()
     return jsonify(item_json(get_item(iid), False))
+
+
+@app.post("/api/items/<int:iid>/reserve")
+def reserve(iid):
+    item = shopper_item(iid)
+    data = json_body()
+    em = g.user["email"]
+    if data.get("reserved", True):
+        who = text(data, "by")[:80] or g.user["name"]
+        cur = db().execute("UPDATE items SET reserved_by = ?, reserved_by_email = ?, reserved_at = ? "
+                           "WHERE id = ? AND purchased = 0 AND reserved_by IS NULL",
+                           (who, em, int(time.time()), iid))
+        if cur.rowcount == 0:
+            now = get_item(iid)
+            if now["purchased"]:
+                abort(400, f"Already marked as purchased by {now['purchased_by']}.")
+            abort(400, f"Already reserved by {now['reserved_by']}.")
+    else:
+        mine = em and item["reserved_by_email"] == em
+        if not (mine or g.user["role"] == "editor"):
+            abort(403, "Only the person who reserved it (or an editor) can release it.")
+        if item["removed_by_owner"] and not item["purchased"]:
+            # Owner already removed it; once nobody is getting it there's nothing to keep.
+            db().execute("DELETE FROM items WHERE id = ?", (iid,))
+            db().commit()
+            remove_photo_files(iid)
+            return jsonify(deleted=True)
+        db().execute("UPDATE items SET reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
+                     "WHERE id = ?", (iid,))
+    db().commit()
+    return jsonify(item_json(get_item(iid), False))
+
+
+OWN_ARCHIVE = "Someone else has to archive the gifts on your own list."
+
+
+@app.post("/api/items/<int:iid>/archive")
+@editor_required
+def archive_item(iid):
+    item = get_item(iid)
+    if is_owner(get_person(item["person_id"])):
+        abort(403, OWN_ARCHIVE)
+    if json_body().get("archived", True):
+        if not item["purchased"]:
+            abort(400, "Only purchased items can be archived.")
+        db().execute("UPDATE items SET archived_at = ? WHERE id = ? AND archived_at IS NULL",
+                     (int(time.time()), iid))
+    else:
+        db().execute("UPDATE items SET archived_at = NULL WHERE id = ?", (iid,))
+    db().commit()
+    return jsonify(item_json(get_item(iid), False))
+
+
+@app.post("/api/people/<int:pid>/archive")
+@editor_required
+def archive_purchased(pid):
+    """Archive everything purchased on a tab, e.g. once the presents have been opened."""
+    if is_owner(get_person(pid)):
+        abort(403, OWN_ARCHIVE)
+    cur = db().execute("UPDATE items SET archived_at = ? WHERE person_id = ? AND purchased = 1 "
+                       "AND archived_at IS NULL", (int(time.time()), pid))
+    db().commit()
+    return jsonify(archived=cur.rowcount)
 
 
 # ---------------------------------------------------------------- photos
@@ -541,9 +699,9 @@ def _save_jpeg(img, path, max_side):
 
 
 @app.post("/api/items/<int:iid>/photo")
-@editor_required
 def upload_photo(iid):
     item = get_item(iid)
+    require_edit(item)
     if Image is None:
         abort(503, "Photo support isn't installed on the server (py3-pillow).")
     f = request.files.get("photo")
@@ -566,9 +724,9 @@ def upload_photo(iid):
 
 
 @app.delete("/api/items/<int:iid>/photo")
-@editor_required
 def delete_photo(iid):
     item = get_item(iid)
+    require_edit(item)
     db().execute("UPDATE items SET photo_ver = NULL WHERE id = ?", (iid,))
     db().commit()
     remove_photo_files(iid)
@@ -581,8 +739,6 @@ def get_photo(iid, size):
         abort(404, "Not found.")
     item = get_item(iid)
     if not item["photo_ver"]:
-        abort(404, "No photo.")
-    if item["removed_by_owner"] and is_owner(get_person(item["person_id"])):
         abort(404, "No photo.")
     full, thumb = photo_paths(iid)
     resp = send_from_directory(PHOTO_DIR, os.path.basename(full if size == "full" else thumb),

@@ -33,8 +33,13 @@
   <div id="ownerNote" class="note" hidden>This is your list. Purchases are hidden from you so nothing gets spoiled.</div>
   <div class="toolbar">
     <div id="summary" class="summary"></div>
+    <div class="tab-actions">
+      <button id="archiveAllBtn" class="btn small" hidden>Archive purchased</button>
+      <button id="historyBtn" class="btn small" hidden>History</button>
+    </div>
     <div class="controls">
-      <label class="toggle"><input type="checkbox" id="showBought" checked> Show purchased</label>
+      <select id="occasion" aria-label="Filter by occasion" hidden></select>
+      <label class="toggle" id="showBoughtLabel"><input type="checkbox" id="showBought" checked> Show purchased</label>
       <select id="sort" aria-label="Sort items">
         <option value="manual">My order</option>
         <option value="priority">Priority</option>
@@ -52,7 +57,7 @@
 
 <button id="addBtn" class="fab" hidden>
   <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
-  Add item
+  <span id="addLabel">Add item</span>
 </button>
 
 <!-- Add / edit item -->
@@ -78,6 +83,9 @@
       </label>
     </div>
     <label>Notes<textarea name="notes" rows="2" maxlength="1000" placeholder="Size, color, model…"></textarea></label>
+    <label>Occasion<input name="occasion" maxlength="60" placeholder="e.g. Christmas, Birthday" list="occasionList"></label>
+    <datalist id="occasionList"></datalist>
+    <label class="check" id="secretRow" hidden><input type="checkbox" name="secret"> <span>Secret idea: hidden from <span id="secretWho"></span></span></label>
     <div class="photo-field">
       <span class="field-label">Photo</span>
       <div class="photo-row">
@@ -99,13 +107,13 @@
 <!-- Mark purchased -->
 <dialog id="buyDlg">
   <form id="buyForm" method="dialog">
-    <h2>Mark as purchased</h2>
+    <h2 id="buyTitle">Mark as purchased</h2>
     <p id="buyWhat" class="muted"></p>
-    <label>Who got it?<input name="by" maxlength="80" required></label>
+    <label><span id="buyLabel">Who got it?</span><input name="by" maxlength="80" required></label>
     <p class="form-error" id="buyErr"></p>
     <div class="actions">
       <button type="button" class="ghost" data-close>Cancel</button>
-      <button type="submit" class="primary">Mark purchased</button>
+      <button type="submit" class="primary" id="buySubmit">Mark purchased</button>
     </div>
   </form>
 </dialog>

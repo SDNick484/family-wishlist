@@ -97,7 +97,7 @@ main { max-width: 760px; margin: 0 auto; padding: 0 16px; }
 }
 .summary { color: var(--muted); font-size: .9rem; }
 .summary b { color: var(--ink); }
-.controls { display: flex; align-items: center; gap: 10px; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
 .toggle { font-size: .85rem; color: var(--muted); display: flex; align-items: center; gap: 6px; }
 select {
   border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 7px 10px;
@@ -140,6 +140,14 @@ select {
 }
 .got svg { width: 16px; height: 16px; }
 .removed { font-size: .8rem; color: var(--berry); }
+.tag {
+  font-size: .78rem; padding: 1px 8px; border-radius: 999px;
+  background: var(--bg); border: 1px solid var(--line); color: var(--ink);
+}
+.idea, .got.reserved { color: color-mix(in srgb, var(--gold) 70%, var(--ink)); }
+.idea { font-size: .8rem; font-weight: 600; }
+.item.secret { border-style: dashed; }
+.tab-actions { display: flex; gap: 8px; margin-right: auto; }
 
 .empty { text-align: center; color: var(--muted); padding: 40px 10px; }
 
@@ -180,6 +188,8 @@ form.kind-online .only-store, form.kind-store .only-online { display: none; }
 .primary, .ghost { border-radius: 10px; padding: 9px 16px; font-weight: 700; cursor: pointer; }
 .primary { background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent); }
 .ghost { background: none; border: 1px solid var(--line); }
+dialog label.check { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 500; }
+dialog label.check input { width: auto; }
 .form-error { color: var(--berry); margin: 0; font-size: .88rem; min-height: 0; }
 .form-error:empty { display: none; }
 .muted { color: var(--muted); margin: 0; }

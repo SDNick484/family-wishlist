@@ -298,7 +298,8 @@ class TestPhotos:
 
 # ------------------------------------------------------------------ upgrades
 def test_upgrade_from_first_release_schema(tmp_path, monkeypatch):
-    """Databases created before tab colors and photos existed gain the new columns, keeping data."""
+    """Databases created before tab colors, photos, ideas, reservations and the archive existed
+    gain the new columns, keeping data."""
     import sqlite3
     db = tmp_path / "wishlist.db"
     conn = sqlite3.connect(db)
@@ -320,7 +321,11 @@ def test_upgrade_from_first_release_schema(tmp_path, monkeypatch):
     wishlist.init_db()
     conn = sqlite3.connect(db)
     assert "color" in [r[1] for r in conn.execute("PRAGMA table_info(people)")]
-    assert "photo_ver" in [r[1] for r in conn.execute("PRAGMA table_info(items)")]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(items)")]
+    for col in ("photo_ver", "secret", "created_by_email", "reserved_by", "reserved_by_email", "reserved_at",
+                "occasion", "archived_at"):
+        assert col in cols, col
+    assert conn.execute("SELECT secret, archived_at FROM items").fetchall() == [(0, None)]
     assert conn.execute("SELECT name FROM items").fetchall() == [("Kept",)]
     # "Sam|Sammy" in PERSON_COLORS matches the alias
     assert conn.execute("SELECT color FROM people").fetchone() == ("#2563eb",)
