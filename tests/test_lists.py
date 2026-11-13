@@ -13,6 +13,14 @@ GRANDMA = "grandma@example.com"
 ALEX = "alex@example.com"
 
 
+def reserved_at(iid):
+    con = sqlite3.connect(wishlist.DB_PATH)
+    try:
+        return con.execute("SELECT reserved_at FROM items WHERE id = ?", (iid,)).fetchone()[0]
+    finally:
+        con.close()
+
+
 def items_of(client, pid, email=ADMIN):
     return client.get(f"/api/people/{pid}/items", email).json["items"]
 
@@ -647,6 +655,40 @@ class TestSpoilersMore:
             assert (a.status_code, a.get_data()) == (b.status_code, b.get_data()) and a.status_code == 404, path
 
     # secret ideas
+    def test_feed_writes_leave_every_owner_view_byte_identical(self, client, owned, bought, feed_on):
+        """After the feed reserves, re-labels, buys, undoes and releases, nothing the owner can ask for
+        differs, down to the byte, from before; everyone else sees it all."""
+        kite = add(client, owned, name="Kite", occasion="Birthday", price=7).json["id"]
+        ball = add(client, owned, name="Ball").json["id"]
+        surprise = idea(client, owned, name="Surprise").json["id"]
+        client.upload(kite, png())
+        open_ = next(i["id"] for i in items_of(client, owned, ALEX) if i["name"] == "Open")
+        views = ("/api/people", f"/api/people/{owned}/items", f"/api/people/{owned}/history", "/api/occasions",
+                 "/api/me", f"/photos/{kite}/full", f"/photos/{kite}/thumb", f"/photos/{surprise}/full")
+
+        def snapshot():
+            out = {path: (r.status_code, r.get_data()) for path in views for r in [client.get(path, ALEX)]}
+            for path in ("/api/items/{}/purchase", "/api/items/{}/reserve"):
+                for iid in (kite, ball, surprise, open_, bought):
+                    r = client.req("post", path.format(iid), ALEX, json={})
+                    out[(path, iid)] = (r.status_code, r.get_data())
+            return out
+
+        def fr(iid, by):
+            return feed(client, "post", f"/api/feed/items/{iid}/reserve", {"by": by})
+
+        def fp(iid, by="Uncle", purchased=True):
+            return feed(client, "post", f"/api/feed/items/{iid}/purchase", {"by": by, "purchased": purchased})
+
+        before = snapshot()
+        for step in (lambda: fr(kite, "Aunt"), lambda: fr(kite, "Uncle"), lambda: fr(surprise, "Aunt"),
+                     lambda: fp(ball, "Aunt"), lambda: fp(surprise, "Uncle"), lambda: fp(ball, purchased=False),
+                     lambda: fr(kite, None), lambda: fr(open_, "Aunt"), lambda: fp(open_, "Aunt")):
+            assert step().status_code == 200
+            assert snapshot() == before
+        theirs = {i["id"]: i for i in items_of(client, owned, GRANDMA)}
+        assert (theirs[open_]["purchased_by"], theirs[surprise]["purchased_by"]) == ("Aunt", "Uncle")
+
     @pytest.fixture
     def secret(self, client, owned):
         r = idea(client, owned, name="Surprise drone", occasion="Hush birthday")
@@ -973,14 +1015,31 @@ class TestFeed:
         assert client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"purchased": False}).status_code == 403
         assert client.post(f"/api/items/{iid}/purchase", ADMIN, json={"purchased": False}).status_code == 200
 
-    def test_archived_items_are_409(self, client, owned, feed_on):
+    def test_archived_items_answer_like_a_missing_item(self, client, owned, feed_on):
         iid = add(client, owned).json["id"]
         self.purchase(client, iid, "Uncle")
         client.post(f"/api/items/{iid}/archive", ADMIN)
-        for r in (self.reserve(client, iid, "Aunt"), self.reserve(client, iid, None),
-                  self.purchase(client, iid, "Aunt"), self.purchase(client, iid, purchased=False)):
-            assert (r.status_code, r.json) == (409, {"error": "That gift has been archived."})
+        for path, body in (("reserve", {"by": "Aunt"}), ("reserve", {"by": None}),
+                           ("purchase", {"by": "Aunt", "purchased": True}), ("purchase", {"by": "Uncle", "purchased": False})):
+            a = feed(client, "post", f"/api/feed/items/{iid}/{path}", body)
+            b = feed(client, "post", f"/api/feed/items/99999/{path}", body)
+            assert (a.status_code, a.json) == (b.status_code, b.json) == (404, {"error": "No such item."})
         assert self.items(client, archived=True)["Thing"]["purchased_by"] == "Uncle"
+
+    def test_ids_sqlite_cannot_hold_answer_like_a_missing_item(self, client, feed_on):
+        for path in ("reserve", "purchase"):
+            r = feed(client, "post", f"/api/feed/items/{2 ** 63}/{path}", {"by": "Uncle"})
+            assert (r.status_code, r.json) == (404, {"error": "No such item."})
+
+    def test_relabel_keeps_reserved_at_only_for_the_same_name(self, client, owned, feed_on, monkeypatch):
+        iid = add(client, owned).json["id"]
+        monkeypatch.setattr(wishlist.time, "time", lambda: 1000)
+        self.reserve(client, iid, "Uncle")
+        monkeypatch.setattr(wishlist.time, "time", lambda: 2000)
+        self.reserve(client, iid, "Uncle")
+        assert reserved_at(iid) == 1000
+        self.reserve(client, iid, "Aunt")
+        assert reserved_at(iid) == 2000
 
     def test_tab_outside_feed_people_answers_like_a_missing_item(self, client, people, owned, feed_on):
         iid = add(client, people["Sam"]).json["id"]
@@ -990,16 +1049,41 @@ class TestFeed:
             assert (a.status_code, a.json) == (b.status_code, b.json) == (404, {"error": "No such item."})
         assert self.state(client, people["Sam"], iid) == (None, False, None)
 
-    def test_owner_removed_item_is_dropped_once_nobody_is_getting_it(self, client, owned, feed_on):
+    def test_owner_removed_item_survives_the_trackers_relabel(self, client, owned, feed_on):
+        # The tracker re-labels a purchase as "undo, then buy (or reserve) again", and takes a failed
+        # change back the same way; neither step may delete the wish in between.
         held, bought = add(client, owned, name="Held").json["id"], add(client, owned, name="Bought").json["id"]
         self.reserve(client, held, "Uncle")
         self.purchase(client, bought, "Uncle")
         client.delete(f"/api/items/{held}", ALEX)
         client.delete(f"/api/items/{bought}", ALEX)
         assert set(self.items(client)) == {"Held", "Bought"}
-        assert self.reserve(client, held, None).json == {"deleted": True}
-        assert self.purchase(client, bought, purchased=False).json == {"deleted": True}
-        assert self.items(client) == {} and items_of(client, owned) == []
+        r = self.purchase(client, bought, "Uncle", purchased=False)
+        assert r.status_code == 200 and r.json["purchased"] is False
+        r = self.purchase(client, bought, "Aunt")
+        assert r.status_code == 200 and r.json["purchased_by"] == "Aunt"
+        r = self.reserve(client, held, None)
+        assert r.status_code == 200 and r.json["reserved_by"] is None
+        r = self.reserve(client, held, "Uncle")  # the tracker's rollback of that release
+        assert r.status_code == 200 and r.json["reserved_by"] == "Uncle"
+        assert set(self.items(client)) == {"Held", "Bought"}
+        assert tab(client, owned, ALEX)["count"] == 0 and items_of(client, owned, ALEX) == []
+
+    def test_owner_removed_item_nobody_is_getting_is_gone_everywhere(self, client, owned, feed_on):
+        held = add(client, owned, name="Held").json["id"]
+        self.reserve(client, held, "Uncle")
+        client.delete(f"/api/items/{held}", ALEX)
+        assert self.reserve(client, held, None).status_code == 200
+        # Like a wish deleted on the wishlist: out of the feed, and unseen by shoppers, editors and the owner.
+        assert self.items(client) == {}
+        for email in (ADMIN, GRANDMA, ALEX):
+            assert items_of(client, owned, email) == []
+            assert reserve(client, held, email).status_code == 404
+            assert client.post(f"/api/items/{held}/purchase", email).status_code == 404
+        # The feed can still claim it back (the tracker's rollback), which brings it back for shoppers.
+        assert self.reserve(client, held, "Uncle").status_code == 200
+        assert [i["name"] for i in items_of(client, owned, GRANDMA)] == ["Held"]
+        assert items_of(client, owned, ALEX) == []
 
     @pytest.mark.parametrize("body", [{}, {"by": ""}, {"by": "   "}, {"by": 5}, {"by": ["x"]}])
     def test_reserve_needs_a_name_or_null(self, client, owned, feed_on, body):

@@ -327,12 +327,19 @@ def get_person(pid):
     return row
 
 
+def orphaned(item):
+    """The owner removed it and nobody is getting it any more. The shopper routes delete such an item
+    at once; the companion feed leaves it in place (its re-label is an undo then a new claim, and its
+    rollback re-applies a claim), so it is hidden everywhere until the feed claims it again."""
+    return bool(item["removed_by_owner"]) and not item["purchased"] and item["reserved_by"] is None
+
+
 def can_see(item, owner):
     """Whether the user may know this item exists; `owner` says whether its tab is theirs.
 
     Every route reaches items through this, so a hidden item answers exactly like a missing one.
     """
-    if owner and item["removed_by_owner"]:
+    if item["removed_by_owner"] and (owner or orphaned(item)):
         return False
     if item["secret"]:
         # Secret ideas need an identity (LAN users could be the owner) and stay hidden from
@@ -735,7 +742,9 @@ def archive_purchased(pid):
 # ---------------------------------------------------------------- companion feed
 # One trusted service on the LAN (FEED_TOKEN) reads the tabs in FEED_PEOPLE with their full gift
 # state and reserves or buys on someone's behalf. Its reservations and purchases carry no email,
-# which is how it tells its own from a signed-in shopper's: it may only change the former.
+# which is how it tells its own from a signed-in shopper's: it may only change the former. (A LAN
+# visitor's carry no email either, so the feed may change those too.) The contract it is held to is
+# SDNick484/gift-tracker docs/wishlist-feed.md.
 FEED_ENDPOINTS = ("feed", "feed_reserve", "feed_purchase")
 FEED_FIELDS = ("id", "name", "url", "store", "price", "occasion", "secret", "reserved_by",
                "reserved_by_email", "purchased", "purchased_by", "purchased_by_email", "archived_at")
@@ -747,10 +756,16 @@ def feed_item_json(row):
     return d
 
 
+SQLITE_MAX_INT = 2 ** 63 - 1
+
+
 def feed_item(iid):
-    """An item on a tab the feed exposes; any other id answers like a missing one."""
+    """An unarchived item on a tab the feed exposes; anything else (an archived gift, another tab, an id
+    SQLite can't hold) answers exactly like a missing id, which the tracker reads as "gone, refetch"."""
+    if iid > SQLITE_MAX_INT:
+        abort(404, "No such item.")
     row = db().execute("SELECT items.*, people.name AS tab_name FROM items JOIN people ON people.id = person_id "
-                       "WHERE items.id = ?", (iid,)).fetchone()
+                       "WHERE items.id = ? AND items.archived_at IS NULL", (iid,)).fetchone()
     if not row or row["tab_name"].strip().lower() not in FEED_PEOPLE:
         abort(404, "No such item.")
     return row
@@ -767,17 +782,6 @@ def feed_label(data):
     return who
 
 
-def feed_drop_if_removed(iid):
-    """The owner removed this item and nobody is getting it any more: nothing left to keep,
-    exactly as the shopper routes do it."""
-    cur = db().execute("DELETE FROM items WHERE id = ? AND removed_by_owner = 1 AND purchased = 0 "
-                       "AND reserved_by IS NULL", (iid,))
-    db().commit()
-    if cur.rowcount:
-        remove_photo_files(iid)
-    return bool(cur.rowcount)
-
-
 @app.get("/api/feed", provide_automatic_options=False)
 @feed_required
 def feed():
@@ -787,7 +791,8 @@ def feed():
     q = "SELECT * FROM items WHERE person_id = ?" + ("" if archived else " AND archived_at IS NULL")
     return jsonify(people=[{"id": p["id"], "name": p["name"],
                             "items": [feed_item_json(r) for r in db().execute(q + " ORDER BY position, id",
-                                                                              (p["id"],))]}
+                                                                              (p["id"],))
+                                      if not orphaned(r)]}
                            for p in people])
 
 
@@ -802,9 +807,11 @@ def feed_reserve(iid):
         who = feed_label(data)
         # One statement, like reserve(): a shopper's reservation or a purchase landing at the same
         # moment makes it match nothing. A feed reservation (no email) may be re-labelled.
-        cur = db().execute("UPDATE items SET reserved_by = ?, reserved_by_email = NULL, reserved_at = ? "
+        # Re-labelling to the same name keeps when it was first reserved.
+        cur = db().execute("UPDATE items SET reserved_at = CASE WHEN reserved_by IS ? THEN reserved_at ELSE ? END, "
+                           "reserved_by = ?, reserved_by_email = NULL "
                            "WHERE id = ? AND purchased = 0 AND archived_at IS NULL "
-                           "AND (reserved_by IS NULL OR reserved_by_email IS NULL)", (who, int(time.time()), iid))
+                           "AND (reserved_by IS NULL OR reserved_by_email IS NULL)", (who, int(time.time()), who, iid))
     else:
         cur = db().execute("UPDATE items SET reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
                            "WHERE id = ? AND archived_at IS NULL AND (reserved_by IS NULL OR reserved_by_email IS NULL)",
@@ -812,13 +819,9 @@ def feed_reserve(iid):
     db().commit()
     now = feed_item(iid)
     if cur.rowcount == 0:
-        if now["archived_at"]:
-            return feed_conflict("That gift has been archived.")
         if now["purchased"]:
             return feed_conflict(f"Already purchased by {now['purchased_by']}.")
         return feed_conflict(f"Reserved by {now['reserved_by']}.")
-    if data["by"] is None and feed_drop_if_removed(iid):
-        return jsonify(deleted=True)
     return jsonify(feed_item_json(now))
 
 
@@ -845,13 +848,9 @@ def feed_purchase(iid):
     db().commit()
     now = feed_item(iid)
     if cur.rowcount == 0:
-        if now["archived_at"]:
-            return feed_conflict("That gift has been archived.")
         if now["purchased"]:
             return feed_conflict(f"{'Already purchased' if purchased else 'Purchased'} by {now['purchased_by']}.")
         return feed_conflict(f"Reserved by {now['reserved_by']}.")
-    if not purchased and feed_drop_if_removed(iid):
-        return jsonify(deleted=True)
     return jsonify(feed_item_json(now))
 
 
