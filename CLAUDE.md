@@ -45,7 +45,9 @@ SEED_PEOPLE="Alex,Sam" python3 app.py  # http://localhost:8766, LAN requests are
   `X-Wishlist`/`Origin` check. `feed_caller()` decides it per request (feed endpoint, token set and equal,
   private address, no Cloudflare header or cookie); anything else falls through to the normal checks and
   `@feed_required` answers 404 exactly like an unknown route (wrong verbs too). Keep it that narrow, and
-  test any change in `TestSpoilersMore` against an unknown `/api` path. Contract with SDNick484/gift-tracker.
+  test any change in `TestSpoilersMore` against an unknown `/api` path. The contract is SDNick484/gift-tracker
+  `docs/wishlist-feed.md`: honor it exactly. Feed writes never delete an owner-removed item (`orphaned()` hides
+  it instead), because the tracker re-labels and rolls back as an undo followed by a new claim.
 - **Input.** Read bodies with `json_body()` and string fields with `text(data, key)` so bad shapes
   return 400. Never store non-finite numbers: they serialize to invalid JSON.
 - **Outbound fetches.** The server fetches URLs only through `_fetch` (link preview), which allows
