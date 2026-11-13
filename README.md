@@ -89,6 +89,26 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
    non-public addresses (re-checked on each of at most 3 redirects, and the connection goes to the address
    that was checked), and gives up after 5 seconds, 1 MB of page or 20 MB of image. The photo is
    downloaded and re-encoded like an upload, so the page never loads images from other sites.
+7. **Private feed** for one trusted companion service on the LAN (a private gift planner that records which
+   giver has been handed which wish, so shoppers here don't buy something already spoken for).
+   `GET /api/feed` returns the tabs in `FEED_PEOPLE` with every item on them, including secret ideas, items
+   the owner removed after a reservation or purchase, and who reserved or bought each one, with their
+   email (archived items only with `?archived=1`). `POST /api/feed/items/<id>/reserve` with `{"by": "<name>"}`
+   reserves under that name, or re-labels a reservation that has no email; `{"by": null}` releases one.
+   `POST /api/feed/items/<id>/purchase` with `{"by": "<name>", "purchased": true}` marks it bought (ending a
+   reservation that has no email); `"purchased": false` undoes a purchase that has no email and leaves the
+   item open. A reservation or purchase by a signed-in shopper, or reserving a bought item, is 409; an item
+   on another tab, archived or missing is 404. Releasing or undoing what nobody holds succeeds and changes
+   nothing. Writes need a JSON body but no `X-Wishlist` header.
+   Because the feed returns exactly what spoiler protection hides, it answers only a request that has
+   `Authorization: Bearer <FEED_TOKEN>` (compared in constant time; never a query string or cookie), comes
+   from a private address, and carries **no** Cloudflare header or `CF_Authorization` cookie, so it can't be
+   reached through the tunnel. It ignores `LAN_ROLE` and identity entirely. Any other request to an
+   `/api/feed` path, the right token included, gets exactly what a path that doesn't exist gets. Anything
+   with no email (a reservation or purchase made by the feed, or typed in by a LAN visitor) counts as the
+   feed's to change. Over plain `http://` the token crosses the LAN in clear text: keep the two
+   containers on a trusted segment. The installer only writes `/etc/conf.d/wishlist` on a first install;
+   on an existing one, add `FEED_TOKEN` and `FEED_PEOPLE` to it by hand and `rc-service wishlist restart`.
 
 ## Backups
 
