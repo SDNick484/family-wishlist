@@ -6,7 +6,7 @@ import pytest
 from PIL import Image
 
 import app as wishlist
-from conftest import ADMIN
+from conftest import ADMIN, LAN_IP, PUBLIC_IP, token
 from test_app import add, no_files, png
 
 GRANDMA = "grandma@example.com"
@@ -32,6 +32,29 @@ def owned(client, people):
     client.patch(f"/api/people/{pid}", ADMIN, json={"owner_email": "Alex@Example.com"})
     client.put("/api/members", ADMIN, json={"email": ALEX, "display_name": "Alex", "role": "editor"})
     return pid
+
+
+FEED_TOKEN = "feed-test-token-0123456789"
+
+
+@pytest.fixture
+def feed_on(monkeypatch):
+    """The companion feed is configured and exposes Alex's tab only."""
+    monkeypatch.setattr(wishlist, "FEED_TOKEN", FEED_TOKEN)
+    monkeypatch.setattr(wishlist, "FEED_PEOPLE", {"alex"})
+
+
+def feed(client, method, path, json=None, bearer=FEED_TOKEN, ip=LAN_IP, headers=None):
+    """A request as the companion service: a server on the LAN with a bearer token, no X-Wishlist."""
+    h = {"Authorization": f"Bearer {bearer}"} if bearer is not None else {}
+    h.update(headers or {})
+    kw = {"json": json} if json is not None else {}
+    return getattr(client.c, method)(path, headers=h, environ_base={"REMOTE_ADDR": ip}, **kw)
+
+
+def unknown(path):
+    """The same path with the feed's name swapped for a route that doesn't exist."""
+    return path.replace("/api/feed", "/api/nofeed")
 
 
 # ------------------------------------------------------------------ item fields
@@ -730,6 +753,356 @@ class TestSpoilersMore:
         assert history(client, owned, ALEX) == [] and tab(client, owned, ALEX)["archived"] == 0
         assert [i["name"] for i in history(client, owned, GRANDMA)] == ["Bought"]
 
+    # companion feed: to anyone but the feed caller it is a route that doesn't exist
+    FEED_PROBES = (("get", "/api/feed", None), ("get", "/api/feed?archived=1", None),
+                   ("post", "/api/feed/items/{}/reserve", {"by": "Uncle"}),
+                   ("post", "/api/feed/items/{}/reserve", {"by": None}),
+                   ("post", "/api/feed/items/{}/purchase", {"by": "Uncle"}),
+                   ("post", "/api/feed/items/{}/purchase", {"purchased": False}),
+                   ("get", "/api/feed/items/{}/reserve", None), ("post", "/api/feed", {}),
+                   ("options", "/api/feed", None), ("options", "/api/feed/items/{}/purchase", None),
+                   ("put", "/api/feed/items/{}/purchase", {}))
+
+    def same_as_unknown(self, send, bought):
+        for method, path, body in self.FEED_PROBES:
+            path = path.format(bought)
+            a, b = send(method, path, body), send(method, unknown(path), body)
+            assert (a.status_code, a.get_data()) == (b.status_code, b.get_data()), (method, path)
+            assert a.status_code in (400, 403, 404), (method, path, a.status_code)
+            assert "Grandma" not in a.get_data(as_text=True)
+
+    def assert_untouched(self, client, owned, bought):
+        item = {i["id"]: i for i in items_of(client, owned, GRANDMA)}[bought]
+        assert (item["purchased_by"], item["reserved_by"]) == ("Grandma", None)
+
+    @pytest.mark.parametrize("email", [ALEX, GRANDMA, ADMIN])
+    def test_feed_is_an_unknown_route_to_signed_in_users(self, client, owned, bought, feed_on, email):
+        # the tab owner, a shopper and an editor, with and without the CSRF header
+        for csrf in (True, False):
+            self.same_as_unknown(lambda m, p, b: client.req(m, p, email, json=b, csrf=csrf), bought)
+        assert client.get("/api/feed", email).status_code == 404
+        self.assert_untouched(client, owned, bought)
+
+    def test_feed_is_an_unknown_route_to_lan_editors(self, client, owned, bought, feed_on):
+        assert wishlist.LAN_ROLE == "editor"
+        for h in ({}, {"X-Wishlist": "1"}):
+            self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, bearer=None, headers=h), bought)
+        assert feed(client, "get", "/api/feed", bearer=None).status_code == 404
+        self.assert_untouched(client, owned, bought)
+
+    @pytest.mark.parametrize("bearer", [None, "", "wrong", FEED_TOKEN + "x", FEED_TOKEN[:-1],
+                                        FEED_TOKEN.upper(), "Bearer " + FEED_TOKEN])
+    def test_feed_with_no_or_wrong_token_is_an_unknown_route(self, client, owned, bought, feed_on, bearer):
+        for h in ({}, {"X-Wishlist": "1"}):
+            self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, bearer=bearer, headers=h), bought)
+        self.assert_untouched(client, owned, bought)
+
+    def test_feed_token_in_another_scheme_is_refused(self, client, owned, bought, feed_on):
+        for auth in (f"Basic {FEED_TOKEN}", FEED_TOKEN, f"Token {FEED_TOKEN}"):
+            self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, bearer=None,
+                                                      headers={"Authorization": auth}), bought)
+
+    @pytest.mark.parametrize("header", wishlist.CF_HEADERS)
+    def test_feed_with_a_cloudflare_header_is_refused_even_with_the_token(self, client, owned, bought,
+                                                                         feed_on, header):
+        for h in ({header: "x"}, {header: "x", "X-Wishlist": "1"}):
+            self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, headers=h), bought)
+        self.assert_untouched(client, owned, bought)
+
+    @pytest.mark.parametrize("cookie", ["bogus", token(GRANDMA)])
+    def test_feed_with_an_access_cookie_is_refused_even_with_the_token(self, client, owned, bought, feed_on,
+                                                                      cookie):
+        client.c.set_cookie("CF_Authorization", cookie)
+        self.same_as_unknown(lambda m, p, b: feed(client, m, p, b), bought)
+        self.assert_untouched(client, owned, bought)
+
+    def test_feed_through_the_tunnel_with_a_real_sign_in_is_a_404(self, client, owned, bought, feed_on):
+        # valid token *and* a valid Access JWT: still just an unknown route
+        h = {**client.headers(GRANDMA), "Authorization": f"Bearer {FEED_TOKEN}"}
+        self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, headers=h, ip=PUBLIC_IP), bought)
+        r = feed(client, "get", "/api/feed", headers=h, ip=PUBLIC_IP)
+        assert (r.status_code, r.json) == (404, client.get("/api/nofeed", GRANDMA).json)
+
+    def test_feed_from_a_public_address_is_refused(self, client, owned, bought, feed_on):
+        # (the documentation ranges count as private to ipaddress, so use a real public address)
+        self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, ip="8.8.8.8"), bought)
+        assert feed(client, "get", "/api/feed", ip="8.8.8.8").status_code == 403
+
+    @pytest.mark.parametrize("unset", ["", None])
+    def test_feed_with_no_token_configured_is_an_unknown_route(self, client, owned, bought, feed_on,
+                                                              monkeypatch, unset):
+        monkeypatch.setattr(wishlist, "FEED_TOKEN", "")
+        for bearer in (unset, FEED_TOKEN, "anything"):
+            self.same_as_unknown(lambda m, p, b: feed(client, m, p, b, bearer=bearer), bought)
+        self.assert_untouched(client, owned, bought)
+
+    def test_feed_caller_sees_what_the_owner_must_not(self, client, owned, bought, feed_on):
+        # the reason all of the above matters
+        body = feed(client, "get", "/api/feed").get_data(as_text=True)
+        assert "Grandma" in body and GRANDMA in body
+
+# ------------------------------------------------------------------ companion feed
+class TestFeed:
+    ITEM_KEYS = {"id", "name", "url", "store", "price", "occasion", "secret", "reserved_by", "reserved_by_email",
+                 "purchased", "purchased_by", "purchased_by_email", "archived_at"}
+
+    def items(self, client, archived=False):
+        r = feed(client, "get", "/api/feed?archived=1" if archived else "/api/feed")
+        assert r.status_code == 200
+        return {i["name"]: i for p in r.json["people"] for i in p["items"]}
+
+    def reserve(self, client, iid, by):
+        return feed(client, "post", f"/api/feed/items/{iid}/reserve", {"by": by})
+
+    def purchase(self, client, iid, by="Uncle", purchased=True):
+        return feed(client, "post", f"/api/feed/items/{iid}/purchase", {"by": by, "purchased": purchased})
+
+    def state(self, client, pid, iid):
+        i = {i["id"]: i for i in items_of(client, pid)}[iid]
+        return i["reserved_by"], i["purchased"], i["purchased_by"]
+
+    def test_lists_configured_tabs_with_everything(self, client, owned, people, feed_on):
+        bought = add(client, owned, name="Bought", url="example.com/b", store="Shop", price=12,
+                     occasion="Birthday").json["id"]
+        client.post(f"/api/items/{bought}/purchase", GRANDMA, json={"by": "Grandma"})
+        held = add(client, owned, name="Held").json["id"]
+        reserve(client, held, by="Grandma")
+        idea(client, owned, name="Idea")
+        removed = add(client, owned, name="Removed").json["id"]
+        reserve(client, removed)
+        client.delete(f"/api/items/{removed}", ALEX)
+        old = add(client, owned, name="Old").json["id"]
+        client.post(f"/api/items/{old}/purchase", GRANDMA)
+        client.post(f"/api/items/{old}/archive", ADMIN)
+        add(client, people["Sam"], name="Not exposed")
+
+        r = feed(client, "get", "/api/feed")
+        assert r.status_code == 200 and r.headers["Cache-Control"] == "no-store"
+        assert [(p["id"], p["name"]) for p in r.json["people"]] == [(owned, "Alex")]
+        items = self.items(client)
+        assert set(items) == {"Bought", "Held", "Idea", "Removed"}
+        assert all(set(i) == self.ITEM_KEYS for i in items.values())
+        assert {k: items["Bought"][k] for k in self.ITEM_KEYS - {"id"}} == {
+            "name": "Bought", "url": "https://example.com/b", "store": "Shop", "price": 12.0,
+            "occasion": "Birthday", "secret": False, "reserved_by": None, "reserved_by_email": None,
+            "purchased": True, "purchased_by": "Grandma", "purchased_by_email": GRANDMA, "archived_at": None}
+        assert (items["Held"]["reserved_by"], items["Held"]["reserved_by_email"]) == ("Grandma", GRANDMA)
+        assert items["Idea"]["secret"] is True and items["Removed"]["reserved_by"] == "Grandma"
+        archived = self.items(client, archived=True)
+        assert set(archived) == set(items) | {"Old"} and archived["Old"]["archived_at"]
+
+    def test_tab_names_match_case_insensitively_and_empty_means_none(self, client, people, monkeypatch):
+        monkeypatch.setattr(wishlist, "FEED_TOKEN", FEED_TOKEN)
+        monkeypatch.setattr(wishlist, "FEED_PEOPLE", {"sam", "jordan", "nobody"})
+        assert [p["name"] for p in feed(client, "get", "/api/feed").json["people"]] == ["Sam", "Jordan"]
+        monkeypatch.setattr(wishlist, "FEED_PEOPLE", set())
+        assert feed(client, "get", "/api/feed").json == {"people": []}
+
+    def test_feed_caller_needs_no_lan_role(self, client, owned, feed_on, monkeypatch):
+        monkeypatch.setattr(wishlist, "LAN_ROLE", "none")
+        assert client.lan("get", "/api/people").status_code == 403
+        iid = add(client, owned).json["id"]
+        assert feed(client, "get", "/api/feed").status_code == 200
+        assert self.reserve(client, iid, "Uncle").status_code == 200
+
+    def test_reserve_relabel_and_release(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        r = self.reserve(client, iid, "  Uncle  ")
+        assert r.status_code == 200 and (r.json["reserved_by"], r.json["reserved_by_email"]) == ("Uncle", None)
+        assert set(r.json) == self.ITEM_KEYS
+        assert self.state(client, owned, iid) == ("Uncle", False, None)
+        assert self.reserve(client, iid, "Aunt").json["reserved_by"] == "Aunt"
+        r = self.reserve(client, iid, None)
+        assert r.status_code == 200 and r.json["reserved_by"] is None
+        assert self.reserve(client, iid, None).status_code == 200  # releasing an open item is harmless
+        assert self.state(client, owned, iid) == (None, False, None)
+
+    def test_a_feed_reservation_blocks_shoppers(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        self.reserve(client, iid, "Uncle")
+        r = reserve(client, iid)
+        assert r.status_code == 400 and "Uncle" in r.json["error"]
+        r = client.post(f"/api/items/{iid}/purchase", GRANDMA)
+        assert r.status_code == 400 and "Uncle" in r.json["error"]
+        assert self.state(client, owned, iid) == ("Uncle", False, None)
+
+    def test_shopper_reservation_is_409_for_reserve_relabel_and_release(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        reserve(client, iid, by="Grandma")
+        for by in ("Uncle", None):
+            r = self.reserve(client, iid, by)
+            assert (r.status_code, r.json) == (409, {"error": "Reserved by Grandma."})
+        r = self.purchase(client, iid)
+        assert (r.status_code, r.json) == (409, {"error": "Reserved by Grandma."})
+        assert self.state(client, owned, iid) == ("Grandma", False, None)
+
+    def test_reserving_a_purchased_item_is_409(self, client, owned, feed_on):
+        theirs, ours = add(client, owned).json["id"], add(client, owned).json["id"]
+        client.post(f"/api/items/{theirs}/purchase", GRANDMA, json={"by": "Grandma"})
+        self.purchase(client, ours, "Uncle")
+        for iid, who in ((theirs, "Grandma"), (ours, "Uncle")):
+            r = self.reserve(client, iid, "Aunt")
+            assert (r.status_code, r.json) == (409, {"error": f"Already purchased by {who}."})
+            assert self.state(client, owned, iid) == (None, True, who)
+
+    def test_purchase_ends_a_feed_reservation_and_undo_leaves_it_open(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        self.reserve(client, iid, "Uncle")
+        r = self.purchase(client, iid, "Uncle")
+        assert r.status_code == 200 and (r.json["purchased"], r.json["purchased_by"],
+                                         r.json["purchased_by_email"], r.json["reserved_by"]) == (
+            True, "Uncle", None, None)
+        assert self.state(client, owned, iid) == (None, True, "Uncle")
+        r = self.purchase(client, iid, "Uncle")
+        assert (r.status_code, r.json) == (409, {"error": "Already purchased by Uncle."})
+        r = self.purchase(client, iid, None, purchased=False)  # by isn't needed to undo
+        assert r.status_code == 200 and (r.json["purchased"], r.json["purchased_by"]) == (False, None)
+        assert self.state(client, owned, iid) == (None, False, None)
+        assert self.purchase(client, iid, purchased=False).status_code == 200  # harmless when not bought
+
+    def test_undoing_a_shoppers_purchase_is_409(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"by": "Grandma"})
+        r = self.purchase(client, iid, purchased=False)
+        assert (r.status_code, r.json) == (409, {"error": "Purchased by Grandma."})
+        assert self.state(client, owned, iid) == (None, True, "Grandma")
+
+    def test_shoppers_cannot_undo_a_feed_purchase_but_editors_can(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        self.purchase(client, iid, "Uncle")
+        assert client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"purchased": False}).status_code == 403
+        assert client.post(f"/api/items/{iid}/purchase", ADMIN, json={"purchased": False}).status_code == 200
+
+    def test_archived_items_are_409(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        self.purchase(client, iid, "Uncle")
+        client.post(f"/api/items/{iid}/archive", ADMIN)
+        for r in (self.reserve(client, iid, "Aunt"), self.reserve(client, iid, None),
+                  self.purchase(client, iid, "Aunt"), self.purchase(client, iid, purchased=False)):
+            assert (r.status_code, r.json) == (409, {"error": "That gift has been archived."})
+        assert self.items(client, archived=True)["Thing"]["purchased_by"] == "Uncle"
+
+    def test_tab_outside_feed_people_answers_like_a_missing_item(self, client, people, owned, feed_on):
+        iid = add(client, people["Sam"]).json["id"]
+        for send in (lambda i: self.reserve(client, i, "Uncle"), lambda i: self.reserve(client, i, None),
+                     lambda i: self.purchase(client, i), lambda i: self.purchase(client, i, purchased=False)):
+            a, b = send(iid), send(99999)
+            assert (a.status_code, a.json) == (b.status_code, b.json) == (404, {"error": "No such item."})
+        assert self.state(client, people["Sam"], iid) == (None, False, None)
+
+    def test_owner_removed_item_is_dropped_once_nobody_is_getting_it(self, client, owned, feed_on):
+        held, bought = add(client, owned, name="Held").json["id"], add(client, owned, name="Bought").json["id"]
+        self.reserve(client, held, "Uncle")
+        self.purchase(client, bought, "Uncle")
+        client.delete(f"/api/items/{held}", ALEX)
+        client.delete(f"/api/items/{bought}", ALEX)
+        assert set(self.items(client)) == {"Held", "Bought"}
+        assert self.reserve(client, held, None).json == {"deleted": True}
+        assert self.purchase(client, bought, purchased=False).json == {"deleted": True}
+        assert self.items(client) == {} and items_of(client, owned) == []
+
+    @pytest.mark.parametrize("body", [{}, {"by": ""}, {"by": "   "}, {"by": 5}, {"by": ["x"]}])
+    def test_reserve_needs_a_name_or_null(self, client, owned, feed_on, body):
+        iid = add(client, owned).json["id"]
+        assert feed(client, "post", f"/api/feed/items/{iid}/reserve", body).status_code == 400
+
+    @pytest.mark.parametrize("body", [{}, {"by": ""}, {"by": 5}, {"by": "x", "purchased": "yes"},
+                                      {"by": "x", "purchased": 1}, {"purchased": None}])
+    def test_purchase_validates_its_body(self, client, owned, feed_on, body):
+        iid = add(client, owned).json["id"]
+        assert feed(client, "post", f"/api/feed/items/{iid}/purchase", body).status_code == 400
+        assert self.state(client, owned, iid) == (None, False, None)
+
+    def test_by_is_capped_at_80(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        assert self.reserve(client, iid, "x" * 200).json["reserved_by"] == "x" * 80
+
+    @pytest.mark.parametrize("data", [None, "[1]", "not json"])
+    def test_writes_need_a_json_object(self, client, owned, feed_on, data):
+        iid = add(client, owned).json["id"]
+        h = {"Authorization": f"Bearer {FEED_TOKEN}"}
+        r = client.c.post(f"/api/feed/items/{iid}/reserve", data={"by": "Uncle"} if data is None else data,
+                          headers=h, content_type=None if data is None else "application/json",
+                          environ_base={"REMOTE_ADDR": LAN_IP})
+        assert r.status_code == 400
+        assert self.state(client, owned, iid) == (None, False, None)
+
+    def test_feed_writes_need_no_csrf_header_or_origin_but_nothing_else_is_exempt(self, client, owned, feed_on):
+        iid = add(client, owned).json["id"]
+        assert self.reserve(client, iid, "Uncle").status_code == 200  # no X-Wishlist, no Origin
+        h = {"Authorization": f"Bearer {FEED_TOKEN}"}
+        # the token does nothing for the rest of the API: CSRF still applies there
+        for method, path, body in (("post", f"/api/people/{owned}/items", {"name": "x", "kind": "online"}),
+                                   ("post", f"/api/items/{iid}/reserve", {"reserved": False}),
+                                   ("patch", f"/api/items/{iid}", {"name": "x"}),
+                                   ("delete", f"/api/items/{iid}", {})):
+            assert feed(client, method, path, body).status_code == 400, path
+            r = feed(client, method, path, body, headers={"X-Wishlist": "1", "Origin": "http://evil.example.com"})
+            assert r.status_code == 403, path
+        # and a valid token on another route is just a LAN request, with the LAN role
+        assert feed(client, "get", "/api/me").json["source"] == "lan"
+        assert self.state(client, owned, iid) == ("Uncle", False, None)
+        assert [i["name"] for i in items_of(client, owned)] == ["Thing"]
+
+    def test_unknown_feed_paths_are_still_404_for_the_feed(self, client, feed_on):
+        for path in ("/api/feed/items", "/api/feed/items/1", "/api/feed/people"):
+            assert feed(client, "get", path).status_code == 404
+
+    # concurrency: the claim is one statement, so a write landing after the read still wins
+    def stale(self, monkeypatch, name, sql, args):
+        real = getattr(wishlist, name)
+
+        def read_then_someone_else_writes(item_id):
+            row = real(item_id)
+            monkeypatch.setattr(wishlist, name, real)  # only the first read is stale
+            other = sqlite3.connect(wishlist.DB_PATH)
+            other.execute(sql, (*args, item_id))
+            other.commit()
+            other.close()
+            return row
+
+        monkeypatch.setattr(wishlist, name, read_then_someone_else_writes)
+
+    SHOPPER_RESERVES = ("UPDATE items SET reserved_by = 'Grandma', reserved_by_email = ?, reserved_at = 1 "
+                        "WHERE id = ?", (GRANDMA,))
+    SHOPPER_BUYS = ("UPDATE items SET purchased = 1, purchased_by = 'Grandma', purchased_by_email = ?, "
+                    "purchased_at = 1 WHERE id = ?", (GRANDMA,))
+    FEED_RESERVES = ("UPDATE items SET reserved_by = 'Uncle', reserved_by_email = NULL, reserved_at = 1 "
+                     "WHERE id = ?", ())
+
+    def test_shopper_reserving_first_wins_over_the_feed(self, client, owned, feed_on, monkeypatch):
+        iid = add(client, owned).json["id"]
+        self.stale(monkeypatch, "feed_item", *self.SHOPPER_RESERVES)
+        r = self.reserve(client, iid, "Uncle")
+        assert (r.status_code, r.json) == (409, {"error": "Reserved by Grandma."})
+        assert self.state(client, owned, iid) == ("Grandma", False, None)
+
+    def test_shopper_buying_first_wins_over_a_feed_purchase(self, client, owned, feed_on, monkeypatch):
+        iid = add(client, owned).json["id"]
+        self.stale(monkeypatch, "feed_item", *self.SHOPPER_BUYS)
+        r = self.purchase(client, iid, "Uncle")
+        assert (r.status_code, r.json) == (409, {"error": "Already purchased by Grandma."})
+        assert self.state(client, owned, iid) == (None, True, "Grandma")
+
+    def test_shopper_reserving_first_wins_over_a_feed_purchase(self, client, owned, feed_on, monkeypatch):
+        iid = add(client, owned).json["id"]
+        self.stale(monkeypatch, "feed_item", *self.SHOPPER_RESERVES)
+        assert self.purchase(client, iid, "Uncle").status_code == 409
+        assert self.state(client, owned, iid) == ("Grandma", False, None)
+
+    def test_feed_reserving_first_wins_over_a_shopper(self, client, owned, feed_on, monkeypatch):
+        iid = add(client, owned).json["id"]
+        self.stale(monkeypatch, "get_item", *self.FEED_RESERVES)
+        r = reserve(client, iid, by="Grandma")
+        assert r.status_code == 400 and "Uncle" in r.json["error"]
+        assert self.state(client, owned, iid) == ("Uncle", False, None)
+
+    def test_feed_reserving_first_wins_over_a_shopper_purchase(self, client, owned, feed_on, monkeypatch):
+        iid = add(client, owned).json["id"]
+        self.stale(monkeypatch, "get_item", *self.FEED_RESERVES)
+        r = client.post(f"/api/items/{iid}/purchase", GRANDMA, json={"by": "Grandma"})
+        assert r.status_code == 400 and "Uncle" in r.json["error"]
+        assert self.state(client, owned, iid) == ("Uncle", False, None)
 
 # ------------------------------------------------------------------ tabs
 class TestPeople:
