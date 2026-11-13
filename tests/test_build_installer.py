@@ -97,6 +97,11 @@ class TestGeneratedScript:
     def test_missing_keys_become_empty(self, tmp_path, monkeypatch):
         s = build(tmp_path, monkeypatch, "ADMIN_EMAILS=me@example.com\n")
         assert 'SEED_PEOPLE="${SEED_PEOPLE:-}"' in s
+        assert 'FEED_TOKEN="${FEED_TOKEN:-}"' in s  # no token, no feed
+
+    def test_feed_settings_are_substituted(self, tmp_path, monkeypatch):
+        s = build(tmp_path, monkeypatch, ENV + "FEED_TOKEN=0123abcd\nFEED_PEOPLE=Pat,Lee\n")
+        assert 'FEED_TOKEN="${FEED_TOKEN:-0123abcd}"' in s and 'FEED_PEOPLE="${FEED_PEOPLE:-Pat,Lee}"' in s
 
     @pytest.mark.parametrize("bad", ['a"b', "a`id`", "$(id)", "a\\b", "Pat}Lee"])
     def test_shell_metacharacters_are_refused(self, tmp_path, monkeypatch, bad):
@@ -107,7 +112,7 @@ class TestGeneratedScript:
 
 class TestTemplate:
     template = open(os.path.join(ROOT, "deploy", "setup-wishlist.sh.in"), encoding="utf-8").read()
-    exported = re.search(r"^\s*export (.+)$", template, re.M).group(1).split()
+    exported = re.search(r"^\s*export ((?:.*\\\n)*.*)$", template, re.M).group(1).replace("\\\n", " ").split()
 
     def test_service_never_overwrites_existing_config_or_data(self):
         assert 'if [ ! -f "$CONF" ]; then' in self.template
@@ -117,7 +122,7 @@ class TestTemplate:
         assert 'command_user="wishlist"' in self.template
 
     @pytest.mark.parametrize("var", ["ADMIN_EMAILS", "CF_TEAM_DOMAIN", "CF_AUD", "LAN_ROLE", "LAN_NAME",
-                                     "SEED_PEOPLE", "PERSON_COLORS"])
+                                     "SEED_PEOPLE", "PERSON_COLORS", "FEED_TOKEN", "FEED_PEOPLE"])
     def test_documented_settings_reach_the_app(self, var):
         # OpenRC only passes exported variables to the service
         assert var in self.exported
