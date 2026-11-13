@@ -66,6 +66,8 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
 | `LAN_NAME` | Name shown for LAN users (default `Home`) |
 | `SEED_PEOPLE` | Tabs created on the very first start |
 | `PERSON_COLORS` | Default tab colors, `Name=#hex,Other|Alias=#hex`; only fills tabs without a color |
+| `FEED_TOKEN` | Bearer token of the private feed (see below). Unset or empty: the feed is off and every `/api/feed` path is a 404 |
+| `FEED_PEOPLE` | Comma list of tab names the feed exposes (matched ignoring case). Empty: none |
 
 ## How access works
 

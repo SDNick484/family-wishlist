@@ -9,7 +9,7 @@ container needs nothing but the one file:
     ssh root@<proxmox-host> 'pct push <ctid> /root/setup-wishlist.sh /root/setup-wishlist.sh && \
                              pct exec <ctid> -- sh /root/setup-wishlist.sh'
 
-Household defaults (admin emails, initial tabs, tab colors) come from deploy/deploy.env,
+Household defaults (admin emails, initial tabs, tab colors, feed tabs) come from deploy/deploy.env,
 which is git-ignored. Copy deploy/deploy.env.example to start. They only apply on a
 first install: re-running keeps /etc/conf.d/wishlist and the database as they are.
 """
@@ -24,7 +24,7 @@ import tarfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "deploy", "setup-wishlist.sh.in")
 APP_FILES = ["app.py", "static"]
-KEYS = ("ADMIN_EMAILS", "SEED_PEOPLE", "PERSON_COLORS")
+KEYS = ("ADMIN_EMAILS", "SEED_PEOPLE", "PERSON_COLORS", "FEED_PEOPLE")
 
 
 def read_env(path):

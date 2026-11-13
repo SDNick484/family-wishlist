@@ -126,3 +126,25 @@ class TestTemplate:
         apk = re.search(r"apk add --no-cache (.+?) >", self.template).group(1).split()
         for pkg in ("py3-flask", "py3-gunicorn", "py3-jwt", "py3-cryptography", "py3-pillow"):
             assert pkg in apk
+
+
+class TestFeedSettings:
+    template = TestTemplate.template
+
+    @pytest.mark.parametrize("var", ["FEED_TOKEN", "FEED_PEOPLE"])
+    def test_feed_settings_reach_the_app(self, var):
+        assert var in TestTemplate.exported
+        assert f'{var}="${{{var}:-' in self.template  # written to /etc/conf.d/wishlist on a first install
+
+    def test_feed_tabs_come_from_deploy_env(self, tmp_path, monkeypatch):
+        s = build(tmp_path, monkeypatch, ENV + "FEED_PEOPLE=Pat,Lee\n")
+        assert 'FEED_PEOPLE="${FEED_PEOPLE:-Pat,Lee}"' in s
+
+    def test_feed_token_is_never_baked_into_the_installer(self, tmp_path, monkeypatch):
+        assert "FEED_TOKEN" not in build_installer.KEYS
+        s = build(tmp_path, monkeypatch, ENV + "FEED_TOKEN=do-not-bake-me\n")
+        assert "do-not-bake-me" not in s and 'FEED_TOKEN="${FEED_TOKEN:-}"' in s
+
+    def test_example_leaves_the_feed_off(self):
+        env = build_installer.read_env(os.path.join(ROOT, "deploy", "deploy.env.example"))
+        assert env["FEED_PEOPLE"] == "" and "FEED_TOKEN" not in env

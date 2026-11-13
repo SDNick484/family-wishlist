@@ -10,10 +10,13 @@ Environment:
   CF_AUD          Application Audience (AUD) tag of the Access app
   LAN_ROLE        editor | shopper | none   (default editor)
   LAN_NAME        display name for LAN users (default "Home")
+  FEED_TOKEN      bearer token of the private feed (/api/feed); unset or empty turns it off
+  FEED_PEOPLE     comma list of tab names the feed exposes (default none)
 
 Photos are stored re-encoded as JPEG under DATA_DIR/photos (needs Pillow).
 """
 import base64
+import hmac
 import http.client
 import io
 import ipaddress
@@ -32,6 +35,8 @@ from html.parser import HTMLParser
 from urllib.parse import quote, urljoin, urlparse
 
 from flask import Flask, abort, g, jsonify, request, send_from_directory
+from werkzeug.exceptions import HTTPException
+from werkzeug.routing import Map, Rule
 
 try:
     import jwt
@@ -58,6 +63,8 @@ CF_TEAM_DOMAIN = os.environ.get("CF_TEAM_DOMAIN", "").strip().rstrip("/").remove
 CF_AUD = os.environ.get("CF_AUD", "").strip()
 LAN_ROLE = os.environ.get("LAN_ROLE", "editor").strip().lower()
 LAN_NAME = os.environ.get("LAN_NAME", "Home").strip() or "Home"
+FEED_TOKEN = os.environ.get("FEED_TOKEN", "").strip()
+FEED_PEOPLE = tuple(n.strip() for n in os.environ.get("FEED_PEOPLE", "").split(",") if n.strip())
 
 CF_HEADERS = ("Cf-Ray", "Cf-Connecting-Ip", "Cf-Access-Jwt-Assertion",
               "Cf-Access-Authenticated-User-Email")
@@ -219,6 +226,11 @@ def resolve_user():
 def load_user():
     if request.endpoint in ("healthz",):
         return
+    # The private feed answers here, before any Cloudflare or LAN identity is considered. A request
+    # the feed refuses carries on below exactly like a request for a path that does not exist.
+    feed = feed_dispatch()
+    if feed is not None:
+        return feed
     g.user = resolve_user()
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         # CSRF: require our custom header (cross-site pages can't send it without a CORS
@@ -1127,6 +1139,170 @@ def delete_member(email):
     db().execute("DELETE FROM members WHERE email = ?", (email.lower(),))
     db().commit()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- private feed
+# One trusted companion service on the LAN reads the tabs in FEED_PEOPLE with their reservation and
+# purchase state, and reserves or marks purchased on someone's behalf. That is exactly what spoiler
+# protection hides, so the feed's routes are not in app.url_map at all: load_user() asks
+# feed_dispatch() first, and only a request that passes feed_authorized() is answered by a feed view.
+# Anything else falls through to the normal pipeline, where no route matches, so every refusal
+# (feed off, wrong or missing token, a Cloudflare header, a wrong method or path) is the same
+# response the same caller gets for any path that does not exist. Feed views never call
+# resolve_user(), is_owner() or item_json(): the caller is a server with no identity of its own.
+FEED_MAP = Map(merge_slashes=False)  # exact paths only: no slash merging or trailing-slash match
+FEED_VIEWS = {}
+FEED_ITEM_KEYS = ("id", "name", "url", "store", "price", "occasion", "secret", "reserved_by",
+                  "reserved_by_email", "purchased", "purchased_by", "purchased_by_email", "archived_at")
+SQLITE_MAX_ID = 2 ** 63 - 1
+
+
+def feed_route(rule, method):
+    """Register a feed view on the feed's own map (GET also answers HEAD)."""
+    def deco(fn):
+        FEED_MAP.add(Rule(rule, endpoint=fn.__name__, methods=[method]))
+        FEED_VIEWS[fn.__name__] = fn
+        return fn
+    return deco
+
+
+def feed_authorized():
+    """Whether this request may use the feed: the feed is on, the request came straight from a
+    private address with no Cloudflare header or cookie, and carries `Authorization: Bearer <FEED_TOKEN>`.
+    The token is read from that header only, never a query string or cookie, and never logged."""
+    expected = FEED_TOKEN.strip()
+    if not expected:
+        return False
+    if any(h in request.headers for h in CF_HEADERS) or "CF_Authorization" in request.cookies:
+        return False
+    if not _is_private(request.remote_addr or ""):
+        return False
+    scheme, _, given = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(given.strip().encode("utf-8"), expected.encode("utf-8"))
+
+
+def feed_dispatch():
+    """The response of a feed view, or None to carry on as a non-feed request."""
+    try:
+        endpoint, args = FEED_MAP.bind_to_environ(request.environ).match()
+    except HTTPException:  # not a feed path or method (redirects included): not ours
+        return None
+    if not feed_authorized():
+        return None
+    if request.method == "POST" and not request.is_json:
+        abort(400, "Bad request.")
+    return app.make_response(FEED_VIEWS[endpoint](**args))
+
+
+def feed_tabs():
+    return {n.strip().lower() for n in FEED_PEOPLE}
+
+
+def feed_item_json(row):
+    d = {k: row[k] for k in FEED_ITEM_KEYS}
+    d.update(secret=bool(row["secret"]), purchased=bool(row["purchased"]))
+    return d
+
+
+def feed_item(iid):
+    """An item on a tab in FEED_PEOPLE that is not archived, or 404 like a missing item."""
+    row = db().execute("SELECT items.*, people.name AS tab_name FROM items JOIN people "
+                       "ON people.id = items.person_id WHERE items.id = ?", (iid,)).fetchone()
+    if not row or row["tab_name"].strip().lower() not in feed_tabs() or row["archived_at"] is not None:
+        abort(404, "No such item.")
+    return row
+
+
+def feed_label(data, required):
+    """`by`: the giver's display name, trimmed and capped like the shopper routes; required unless null."""
+    if required and not text(data, "by"):
+        abort(400, "by is required.")
+    return text(data, "by")[:80]
+
+
+def feed_conflict(iid):
+    """The 409 after a claim matched no row: who holds the item now (or 404 if it has gone meanwhile)."""
+    now = feed_item(iid)
+    if now["purchased"]:
+        return jsonify(error=f"Purchased by {now['purchased_by']}."), 409
+    if now["reserved_by"] is not None:
+        return jsonify(error=f"Reserved by {now['reserved_by']}."), 409
+    return jsonify(error="Changed meanwhile. Reload."), 409  # whoever held it let go in between
+
+
+def feed_done(iid):
+    db().commit()
+    return jsonify(feed_item_json(feed_item(iid)))
+
+
+@feed_route("/api/feed", "GET")
+def feed_list():
+    """The tabs in FEED_PEOPLE with every item on them: secret ideas, owner-removed items and
+    reservation and purchase state included; archived items only with ?archived=1."""
+    archived = request.args.get("archived") == "1"
+    tabs = feed_tabs()
+    people = [p for p in db().execute("SELECT id, name FROM people ORDER BY position, id")
+              if p["name"].strip().lower() in tabs]
+    q = "SELECT * FROM items WHERE person_id = ?" + ("" if archived else " AND archived_at IS NULL")
+    return jsonify(people=[{"id": p["id"], "name": p["name"],
+                            "items": [feed_item_json(r) for r in db().execute(q + " ORDER BY position, id",
+                                                                              (p["id"],))]}
+                           for p in people])
+
+
+@feed_route(f"/api/feed/items/<int(max={SQLITE_MAX_ID}):iid>/reserve", "POST")
+def feed_reserve(iid):
+    """{"by": label} reserves (or re-labels a reservation without an email); {"by": null} releases
+    one. A reservation by a signed-in shopper, or a purchase, is someone else's: 409."""
+    data = json_body()
+    if "by" not in data:
+        abort(400, "by is required.")
+    feed_item(iid)
+    if data["by"] is None:
+        # Releasing an item nobody holds matches and changes nothing.
+        cur = db().execute("UPDATE items SET reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
+                           "WHERE id = ? AND archived_at IS NULL AND reserved_by_email IS NULL", (iid,))
+    else:
+        who = feed_label(data, required=True)
+        # One statement, like reserve(): a shopper claiming the item at the same moment cannot both win.
+        cur = db().execute("UPDATE items SET reserved_by = ?, reserved_by_email = NULL, "
+                           "reserved_at = CASE WHEN reserved_by IS ? THEN reserved_at ELSE ? END "
+                           "WHERE id = ? AND archived_at IS NULL AND purchased = 0 "
+                           "AND (reserved_by IS NULL OR reserved_by_email IS NULL)",
+                           (who, who, int(time.time()), iid))
+    if cur.rowcount == 0:
+        db().rollback()
+        return feed_conflict(iid)
+    return feed_done(iid)
+
+
+@feed_route(f"/api/feed/items/<int(max={SQLITE_MAX_ID}):iid>/purchase", "POST")
+def feed_purchase(iid):
+    """{"by": label, "purchased": true} marks it purchased and ends a reservation without an email;
+    "purchased": false undoes a purchase without an email and leaves it open, not reserved."""
+    data = json_body()
+    purchased = data.get("purchased")
+    if not isinstance(purchased, bool):
+        abort(400, "purchased must be true or false.")
+    who = feed_label(data, required=purchased)
+    feed_item(iid)
+    if purchased:
+        cur = db().execute("UPDATE items SET purchased = 1, purchased_by = ?, purchased_by_email = NULL, "
+                           "purchased_at = ?, reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
+                           "WHERE id = ? AND archived_at IS NULL AND purchased = 0 "
+                           "AND (reserved_by IS NULL OR reserved_by_email IS NULL)",
+                           (who, int(time.time()), iid))
+    else:
+        # Undoing something not purchased matches and changes nothing.
+        cur = db().execute("UPDATE items SET purchased = 0, purchased_by = NULL, purchased_by_email = NULL, "
+                           "purchased_at = NULL WHERE id = ? AND archived_at IS NULL AND purchased_by_email IS NULL",
+                           (iid,))
+    if cur.rowcount == 0:
+        db().rollback()
+        return feed_conflict(iid)
+    return feed_done(iid)
 
 
 init_db()

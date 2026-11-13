@@ -1,12 +1,14 @@
 """Items, purchases, spoiler protection, tabs and photos: edge cases not covered in test_app.py."""
+import base64
 import io
+import re
 import sqlite3
 
 import pytest
 from PIL import Image
 
 import app as wishlist
-from conftest import ADMIN
+from conftest import ADMIN, FEED_TOKEN, LAN_IP, PUBLIC_IP, token
 from test_app import add, no_files, png
 
 GRANDMA = "grandma@example.com"
@@ -19,6 +21,15 @@ def items_of(client, pid, email=ADMIN):
 
 def order(client, pid, email=ADMIN):
     return [i["name"] for i in sorted(items_of(client, pid, email), key=lambda i: (i["position"], i["id"]))]
+
+
+def item_rows():
+    """Every column of every item, straight from the database."""
+    con = sqlite3.connect(wishlist.DB_PATH)
+    try:
+        return con.execute("SELECT * FROM items ORDER BY id").fetchall()
+    finally:
+        con.close()
 
 
 def tab(client, pid, email):
@@ -729,6 +740,206 @@ class TestSpoilersMore:
         client.post(f"/api/people/{owned}/archive", ADMIN)
         assert history(client, owned, ALEX) == [] and tab(client, owned, ALEX)["archived"] == 0
         assert [i["name"] for i in history(client, owned, GRANDMA)] == ["Bought"]
+
+    # the private feed (/api/feed): it returns exactly what the rules above hide, so nobody but the
+    # companion service may tell it apart from a path that does not exist
+    FEED_CALLS = (("GET", "/api/feed", None), ("GET", "/api/feed?archived=1", None),
+                  ("POST", "/api/feed/items/{}/reserve", {"by": "Mallory"}),
+                  ("POST", "/api/feed/items/{}/reserve", {"by": None}),
+                  ("POST", "/api/feed/items/{}/purchase", {"by": "Mallory", "purchased": True}),
+                  ("POST", "/api/feed/items/{}/purchase", {"by": "Mallory", "purchased": False}))
+
+    def like_missing(self, client, method, path, body=None, headers=None, ip=LAN_IP, missing=None):
+        """`path` answers exactly (status, headers, body) as the same request for a path that does not
+        exist, and the items table is unchanged afterwards. Returns the response."""
+        missing = missing or re.sub("(?i)feed", "nope", path, count=1)
+        before = item_rows()
+
+        def send(p):
+            kw = {"headers": headers or {}, "environ_base": {"REMOTE_ADDR": ip}}
+            if body is not None:
+                kw["json"] = body
+            return client.c.open(p, method=method, **kw)
+
+        a, b = send(path), send(missing)
+        assert (a.status_code, sorted(a.headers.items()), a.get_data()) == (
+            b.status_code, sorted(b.headers.items()), b.get_data()), (method, path, headers, ip)
+        assert FEED_TOKEN not in a.get_data(as_text=True)
+        assert item_rows() == before, (method, path)
+        return a
+
+    def caller(self, name):
+        """(headers, remote address) of someone who is not the companion service."""
+        bearer = {"Authorization": f"Bearer {FEED_TOKEN}"}
+        owner = {"Cf-Ray": "r", "Cf-Access-Jwt-Assertion": token(ALEX)}
+        shopper = {"Cf-Ray": "r", "Cf-Access-Jwt-Assertion": token(GRANDMA)}
+        return {
+            "owner": (owner, PUBLIC_IP),
+            "owner with the token": (owner | bearer, PUBLIC_IP),
+            "owner with the token via a local tunnel": (owner | bearer, "127.0.0.1"),
+            "owner with a wrong token": (owner | {"Authorization": "Bearer guess"}, PUBLIC_IP),
+            "shopper": (shopper, PUBLIC_IP),
+            "shopper with the token": (shopper | bearer, PUBLIC_IP),
+            "Cloudflare without sign-in, with the token": ({"Cf-Ray": "r"} | bearer, PUBLIC_IP),
+            "LAN editor": ({}, LAN_IP),
+            "LAN with a wrong token": ({"Authorization": "Bearer guess"}, LAN_IP),
+            "LAN with a token prefix": ({"Authorization": f"Bearer {FEED_TOKEN[:-1]}"}, LAN_IP),
+            "LAN with a token plus one": ({"Authorization": f"Bearer {FEED_TOKEN}x"}, LAN_IP),
+            "LAN with an empty bearer": ({"Authorization": "Bearer "}, LAN_IP),
+            "LAN with a bare scheme": ({"Authorization": "Bearer"}, LAN_IP),
+            "LAN with no scheme": ({"Authorization": FEED_TOKEN}, LAN_IP),
+            "LAN with Basic": ({"Authorization": "Basic " + base64.b64encode(f"feed:{FEED_TOKEN}".encode()).decode()},
+                               LAN_IP),
+            "LAN with another scheme": ({"Authorization": f"Token {FEED_TOKEN}"}, LAN_IP),
+            "LAN with another header": ({"X-Feed-Token": FEED_TOKEN}, LAN_IP),
+            "the token from a public address": (bearer, "8.8.8.8"),
+        }[name]
+
+    CALLERS = ("owner", "owner with the token", "owner with the token via a local tunnel", "owner with a wrong token",
+               "shopper", "shopper with the token", "Cloudflare without sign-in, with the token", "LAN editor",
+               "LAN with a wrong token", "LAN with a token prefix", "LAN with a token plus one",
+               "LAN with an empty bearer", "LAN with a bare scheme", "LAN with no scheme", "LAN with Basic",
+               "LAN with another scheme", "LAN with another header", "the token from a public address")
+
+    @pytest.mark.parametrize("who", CALLERS)
+    @pytest.mark.parametrize("csrf", [False, True])
+    def test_feed_is_a_missing_path_to_everyone_else(self, client, owned, bought, feed, who, csrf):
+        headers, ip = self.caller(who)
+        if csrf:  # what the app's own pages send, so the request gets as far as routing
+            headers = headers | {"X-Wishlist": "1"}
+        held = add(client, owned, name="Held").json["id"]
+        assert feed.reserve(held, "Aunt Riley").status_code == 200  # real items: one held by the feed, one bought
+        for iid in (held, bought):
+            for method, path, body in self.FEED_CALLS:
+                self.like_missing(client, method, path.format(iid), body, headers, ip)
+
+    def test_feed_is_a_missing_path_to_the_owner(self, client, owned, bought, feed):
+        """The plain case, spelled out: the owner signed in through Cloudflare gets the generic 404."""
+        for method, path, body in self.FEED_CALLS:
+            r = self.like_missing(client, method, path.format(bought), body,
+                                  {"Cf-Ray": "r", "Cf-Access-Jwt-Assertion": token(ALEX), "X-Wishlist": "1"},
+                                  PUBLIC_IP)
+            assert r.status_code == 404 and "Grandma" not in r.get_data(as_text=True)
+
+    @pytest.mark.parametrize("header", wishlist.CF_HEADERS)
+    @pytest.mark.parametrize("ip", [LAN_IP, "127.0.0.1"])
+    def test_a_valid_token_with_any_cloudflare_header_is_refused(self, client, owned, bought, feed, header, ip):
+        value = token(ALEX) if header == "Cf-Access-Jwt-Assertion" else "x"
+        for name in (header, header.lower()):
+            for extra in ({}, {"X-Wishlist": "1"}):
+                headers = {"Authorization": f"Bearer {FEED_TOKEN}", name: value, **extra}
+                for method, path, body in self.FEED_CALLS:
+                    self.like_missing(client, method, path.format(bought), body, headers, ip)
+        assert feed.get().status_code == 200  # the same token alone works
+
+    def test_a_valid_token_with_a_cloudflare_cookie_is_refused(self, client, owned, bought, feed):
+        client.c.set_cookie("CF_Authorization", token(ALEX))
+        for method, path, body in self.FEED_CALLS:
+            self.like_missing(client, method, path.format(bought), body, {"Authorization": f"Bearer {FEED_TOKEN}"})
+
+    def test_the_token_only_works_in_the_authorization_header(self, client, owned, bought, feed):
+        for method, path, body in self.FEED_CALLS:
+            path = path.format(bought)
+            sep = "&" if "?" in path else "?"
+            for key in ("token", "access_token", "feed_token", "FEED_TOKEN", "bearer"):
+                self.like_missing(client, method, f"{path}{sep}{key}={FEED_TOKEN}", body)
+            for key in ("token", "feed_token", "FEED_TOKEN", "Authorization"):
+                client.c.set_cookie(key, FEED_TOKEN)
+                self.like_missing(client, method, path, body)
+                self.like_missing(client, method, path, body, {"X-Wishlist": "1"})
+                client.c.delete_cookie(key)
+
+    @pytest.mark.parametrize("auth", [None, "Bearer guess", f"Bearer {FEED_TOKEN}"])
+    def test_head_options_and_other_methods_look_missing(self, client, owned, bought, feed, auth):
+        headers = {"Authorization": auth} if auth else {}
+        for path in ("/api/feed", f"/api/feed/items/{bought}/reserve", f"/api/feed/items/{bought}/purchase"):
+            for method in ("OPTIONS", "PUT", "PATCH", "DELETE", "TRACE", "PROPFIND"):
+                self.like_missing(client, method, path, {}, headers)
+                self.like_missing(client, method, path, {}, headers | {"X-Wishlist": "1"})
+            if path != "/api/feed":
+                self.like_missing(client, "GET", path, None, headers)
+                self.like_missing(client, "HEAD", path, None, headers)
+        if auth != f"Bearer {FEED_TOKEN}":
+            self.like_missing(client, "HEAD", "/api/feed", None, headers)
+        else:  # HEAD is GET without the body, for the feed only
+            r = client.c.head("/api/feed", headers=headers, environ_base={"REMOTE_ADDR": LAN_IP})
+            assert r.status_code == 200 and r.get_data() == b""
+
+    def test_other_spellings_of_the_path_look_missing_even_with_the_token(self, client, owned, bought, feed):
+        headers = {"Authorization": f"Bearer {FEED_TOKEN}"}
+        for method, path, body in (
+                ("GET", "/api/feed/", None), ("GET", "/API/FEED", None), ("GET", "/api/Feed", None),
+                ("GET", "/api//feed", None), ("GET", "/api/feed/people", None), ("GET", "/api/feeds", None),
+                ("POST", f"/api/feed/items/{bought}/reserve/", {"by": "x"}),
+                ("POST", f"/api/feed/items/{bought}/Reserve", {"by": "x"}),
+                ("POST", f"/api/FEED/items/{bought}/purchase", {"by": "x", "purchased": True}),
+                ("POST", f"/api/feed/items/{bought}/archive", {}),
+                ("POST", f"/api/feed//items/{bought}/reserve", {"by": "x"}),
+                ("POST", "/api/feed/items/-1/reserve", {"by": "x"}),
+                ("POST", "/api/feed/items/x/reserve", {"by": "x"}),
+                ("POST", "/api/feed/items/99999999999999999999999/reserve", {"by": "x"})):
+            for extra in ({}, {"X-Wishlist": "1"}):
+                self.like_missing(client, method, path, body, headers | extra)
+
+    @pytest.mark.parametrize("value", ["", "   ", " \t "])
+    def test_an_unset_or_blank_token_turns_the_feed_off(self, client, owned, bought, feed, monkeypatch, value):
+        monkeypatch.setattr(wishlist, "FEED_TOKEN", value)
+        for auth in (None, "Bearer", "Bearer ", f"Bearer {value}", "Bearer \t", f"Bearer {FEED_TOKEN}"):
+            headers = {"Authorization": auth} if auth is not None else {}
+            for method, path, body in self.FEED_CALLS:
+                self.like_missing(client, method, path.format(bought), body, headers)
+                self.like_missing(client, method, path.format(bought), body, headers | {"X-Wishlist": "1"})
+
+    def test_feed_writes_leave_every_owner_view_byte_identical(self, client, owned, bought, feed):
+        """After the feed reserves, re-labels, buys, undoes and releases, nothing the owner can ask for
+        differs, down to the byte, from before."""
+        kite = add(client, owned, name="Kite", occasion="Birthday", price=7).json["id"]
+        ball = add(client, owned, name="Ball").json["id"]
+        surprise = idea(client, owned, name="Surprise").json["id"]
+        client.upload(kite, png())
+        open_ = next(i["id"] for i in items_of(client, owned, ALEX) if i["name"] == "Open")
+        views = ("/api/people", f"/api/people/{owned}/items", f"/api/people/{owned}/history", "/api/occasions",
+                 "/api/me", f"/photos/{kite}/full", f"/photos/{kite}/thumb", f"/photos/{surprise}/full",
+                 f"/api/items/{kite}", f"/api/items/{surprise}")
+
+        def snapshot():
+            out = {}
+            for path in views:
+                r = client.get(path, ALEX)
+                out[path] = (r.status_code, r.get_data())
+            for method, path in (("post", "/api/items/{}/purchase"), ("post", "/api/items/{}/reserve")):
+                for iid in (kite, ball, surprise, open_, bought):
+                    r = client.req(method, path.format(iid), ALEX, json={})
+                    out[(path, iid)] = (r.status_code, r.get_data())
+            return out
+
+        before = snapshot()
+        steps = [lambda: feed.reserve(kite, "Aunt Riley"), lambda: feed.reserve(kite, "Uncle Casey"),
+                 lambda: feed.reserve(surprise, "Aunt Riley"), lambda: feed.purchase(ball, "Aunt Riley"),
+                 lambda: feed.purchase(surprise, "Uncle Casey")]
+        for step in steps:
+            assert step().status_code == 200
+            assert snapshot() == before
+        for step in (lambda: feed.purchase(ball, purchased=False), lambda: feed.reserve(kite, None),
+                     lambda: feed.reserve(open_, "Aunt Riley"), lambda: feed.purchase(open_, "Aunt Riley")):
+            assert step().status_code == 200
+            assert snapshot() == before
+        # ...while everyone else sees it all
+        theirs = {i["id"]: i for i in items_of(client, owned, GRANDMA)}
+        assert (theirs[open_]["purchased_by"], theirs[surprise]["purchased_by"]) == ("Aunt Riley", "Uncle Casey")
+
+    def test_feed_reservation_answers_the_owner_like_any_other(self, client, owned, feed):
+        """Owner deletes and edits look the same whether the feed holds the item or nobody does."""
+        held, free = add(client, owned, name="Held").json["id"], add(client, owned, name="Free").json["id"]
+        feed.reserve(held, "Aunt Riley")
+        a = client.patch(f"/api/items/{held}", ALEX, json={"notes": "blue"})
+        b = client.patch(f"/api/items/{free}", ALEX, json={"notes": "blue"})
+        assert self.hidden(a.json) and self.hidden(b.json)
+        a, b = client.delete(f"/api/items/{held}", ALEX), client.delete(f"/api/items/{free}", ALEX)
+        assert (a.status_code, a.json) == (b.status_code, b.json) == (200, {"ok": True})
+        assert items_of(client, owned, ALEX) == []
+        # the feed still has the one it holds, flagged nowhere the owner can see
+        assert held in feed.items() and free not in feed.items()
 
 
 # ------------------------------------------------------------------ tabs

@@ -101,3 +101,43 @@ def people(client):
 
 
 ADMIN = "admin@example.com"
+
+
+FEED_TOKEN = "feed-test-token-6f1d0c2a9b"
+
+
+class Feed:
+    """The companion service: straight from the LAN, `Authorization: Bearer <token>`, no Cloudflare
+    header, no X-Wishlist and no Origin."""
+
+    def __init__(self, flask_client):
+        self.c = flask_client
+
+    def headers(self, token=FEED_TOKEN, extra=None):
+        h = {"Authorization": f"Bearer {token}"} if token is not None else {}
+        return {**h, **(extra or {})}
+
+    def get(self, path="/api/feed", token=FEED_TOKEN, ip=LAN_IP, headers=None):
+        return self.c.get(path, headers=self.headers(token, headers), environ_base={"REMOTE_ADDR": ip})
+
+    def post(self, path, json, token=FEED_TOKEN, ip=LAN_IP, headers=None):
+        return self.c.post(path, json=json, headers=self.headers(token, headers), environ_base={"REMOTE_ADDR": ip})
+
+    def reserve(self, iid, by, **kw):
+        return self.post(f"/api/feed/items/{iid}/reserve", {"by": by}, **kw)
+
+    def purchase(self, iid, by="Aunt Riley", purchased=True, **kw):
+        return self.post(f"/api/feed/items/{iid}/purchase", {"by": by, "purchased": purchased}, **kw)
+
+    def items(self, archived=False):
+        r = self.get("/api/feed?archived=1" if archived else "/api/feed")
+        assert r.status_code == 200, r.data
+        return {i["id"]: i for p in r.json["people"] for i in p["items"]}
+
+
+@pytest.fixture
+def feed(client, monkeypatch):
+    """The feed switched on for the Alex and Sam tabs (Jordan's is not in the feed)."""
+    monkeypatch.setattr(wishlist, "FEED_TOKEN", FEED_TOKEN)
+    monkeypatch.setattr(wishlist, "FEED_PEOPLE", ("Alex", "Sam"))
+    return Feed(client.c)
