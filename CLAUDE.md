@@ -40,6 +40,12 @@ SEED_PEOPLE="Alex,Sam" python3 app.py  # http://localhost:8766, LAN requests are
   is a `shopper` who can view, reserve, mark purchased and add secret ideas. Guard mutating routes
   with `@editor_required`, or `require_edit(item)` where the author of a secret idea may also act.
 - **CSRF.** Mutations need the `X-Wishlist: 1` header and a JSON body (multipart only for photo upload).
+- **Companion feed.** `/api/feed*` (`FEED_TOKEN`, `FEED_PEOPLE`) is the one deliberate exception to all of
+  the above: a bearer-token caller on the LAN gets full gift state, no role, no `g.user`, and no
+  `X-Wishlist`/`Origin` check. `feed_caller()` decides it per request (feed endpoint, token set and equal,
+  private address, no Cloudflare header or cookie); anything else falls through to the normal checks and
+  `@feed_required` answers 404 exactly like an unknown route (wrong verbs too). Keep it that narrow, and
+  test any change in `TestSpoilersMore` against an unknown `/api` path. Contract with SDNick484/gift-tracker.
 - **Input.** Read bodies with `json_body()` and string fields with `text(data, key)` so bad shapes
   return 400. Never store non-finite numbers: they serialize to invalid JSON.
 - **Outbound fetches.** The server fetches URLs only through `_fetch` (link preview), which allows

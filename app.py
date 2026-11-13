@@ -10,10 +10,13 @@ Environment:
   CF_AUD          Application Audience (AUD) tag of the Access app
   LAN_ROLE        editor | shopper | none   (default editor)
   LAN_NAME        display name for LAN users (default "Home")
+  FEED_TOKEN      bearer token for the companion feed (/api/feed); unset = no feed
+  FEED_PEOPLE     comma list of tab names the feed exposes; empty = none
 
 Photos are stored re-encoded as JPEG under DATA_DIR/photos (needs Pillow).
 """
 import base64
+import hmac
 import http.client
 import io
 import ipaddress
@@ -32,6 +35,7 @@ from html.parser import HTMLParser
 from urllib.parse import quote, urljoin, urlparse
 
 from flask import Flask, abort, g, jsonify, request, send_from_directory
+from werkzeug.exceptions import NotFound
 
 try:
     import jwt
@@ -58,6 +62,8 @@ CF_TEAM_DOMAIN = os.environ.get("CF_TEAM_DOMAIN", "").strip().rstrip("/").remove
 CF_AUD = os.environ.get("CF_AUD", "").strip()
 LAN_ROLE = os.environ.get("LAN_ROLE", "editor").strip().lower()
 LAN_NAME = os.environ.get("LAN_NAME", "Home").strip() or "Home"
+FEED_TOKEN = os.environ.get("FEED_TOKEN", "").strip()
+FEED_PEOPLE = {n.strip().lower() for n in os.environ.get("FEED_PEOPLE", "").split(",") if n.strip()}
 
 CF_HEADERS = ("Cf-Ray", "Cf-Connecting-Ip", "Cf-Access-Jwt-Assertion",
               "Cf-Access-Authenticated-User-Email")
@@ -215,10 +221,33 @@ def resolve_user():
     abort(403, "Access denied.")
 
 
+def feed_caller():
+    """Whether this request is the companion service: a feed route, FEED_TOKEN set and matching,
+    straight from the LAN with no trace of Cloudflare. Anything else is not the feed at all."""
+    if not FEED_TOKEN or request.endpoint not in FEED_ENDPOINTS:
+        return False
+    if any(h in request.headers for h in CF_HEADERS) or "CF_Authorization" in request.cookies:
+        return False
+    if not _is_private(request.remote_addr or ""):
+        return False
+    scheme, _, given = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(given.strip().encode(), FEED_TOKEN.encode())
+
+
 @app.before_request
 def load_user():
     if request.endpoint in ("healthz",):
         return
+    g.feed = feed_caller()
+    if g.feed:
+        # A server, not a browser: no identity, no role, no X-Wishlist/Origin. Writes still need JSON.
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and not request.is_json:
+            abort(400, "Bad request.")
+        return
+    # Everyone else goes through the normal checks, so a refused feed request answers exactly
+    # like a route that doesn't exist (see feed_required).
     g.user = resolve_user()
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         # CSRF: require our custom header (cross-site pages can't send it without a CORS
@@ -229,6 +258,16 @@ def load_user():
         origin = request.headers.get("Origin")
         if origin and urlparse(origin).netloc != request.host:
             abort(403, "Cross-origin request blocked.")
+
+
+def feed_required(fn):
+    """Feed routes exist only for the feed caller; for anyone else they are an unknown route."""
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if not g.get("feed"):
+            abort(404)  # Flask's own "Not Found", the same body an unknown route gets
+        return fn(*a, **kw)
+    return wrapper
 
 
 def editor_required(fn):
@@ -265,6 +304,14 @@ def err(e):
         return jsonify(error=e.description), e.code
     return (f"<!doctype html><meta name=viewport content='width=device-width'>"
             f"<p style='font-family:sans-serif;padding:2rem'>{e.description}</p>"), e.code
+
+
+@app.errorhandler(405)
+def wrong_method(e):
+    # A feed route called with the wrong verb must not reveal that it exists.
+    if not g.get("feed") and (request.path == "/api/feed" or request.path.startswith("/api/feed/")):
+        return err(NotFound())
+    return e
 
 
 # ---------------------------------------------------------------- helpers
@@ -683,6 +730,129 @@ def archive_purchased(pid):
                        "AND archived_at IS NULL", (int(time.time()), pid))
     db().commit()
     return jsonify(archived=cur.rowcount)
+
+
+# ---------------------------------------------------------------- companion feed
+# One trusted service on the LAN (FEED_TOKEN) reads the tabs in FEED_PEOPLE with their full gift
+# state and reserves or buys on someone's behalf. Its reservations and purchases carry no email,
+# which is how it tells its own from a signed-in shopper's: it may only change the former.
+FEED_ENDPOINTS = ("feed", "feed_reserve", "feed_purchase")
+FEED_FIELDS = ("id", "name", "url", "store", "price", "occasion", "secret", "reserved_by",
+               "reserved_by_email", "purchased", "purchased_by", "purchased_by_email", "archived_at")
+
+
+def feed_item_json(row):
+    d = {k: row[k] for k in FEED_FIELDS}
+    d["secret"], d["purchased"] = bool(row["secret"]), bool(row["purchased"])
+    return d
+
+
+def feed_item(iid):
+    """An item on a tab the feed exposes; any other id answers like a missing one."""
+    row = db().execute("SELECT items.*, people.name AS tab_name FROM items JOIN people ON people.id = person_id "
+                       "WHERE items.id = ?", (iid,)).fetchone()
+    if not row or row["tab_name"].strip().lower() not in FEED_PEOPLE:
+        abort(404, "No such item.")
+    return row
+
+
+def feed_conflict(msg):
+    return jsonify(error=msg), 409
+
+
+def feed_label(data):
+    who = text(data, "by")[:80]
+    if not who:
+        abort(400, "by must name who it is for.")
+    return who
+
+
+def feed_drop_if_removed(iid):
+    """The owner removed this item and nobody is getting it any more: nothing left to keep,
+    exactly as the shopper routes do it."""
+    cur = db().execute("DELETE FROM items WHERE id = ? AND removed_by_owner = 1 AND purchased = 0 "
+                       "AND reserved_by IS NULL", (iid,))
+    db().commit()
+    if cur.rowcount:
+        remove_photo_files(iid)
+    return bool(cur.rowcount)
+
+
+@app.get("/api/feed", provide_automatic_options=False)
+@feed_required
+def feed():
+    archived = request.args.get("archived") == "1"
+    people = [p for p in db().execute("SELECT id, name FROM people ORDER BY position, id")
+              if p["name"].strip().lower() in FEED_PEOPLE]
+    q = "SELECT * FROM items WHERE person_id = ?" + ("" if archived else " AND archived_at IS NULL")
+    return jsonify(people=[{"id": p["id"], "name": p["name"],
+                            "items": [feed_item_json(r) for r in db().execute(q + " ORDER BY position, id",
+                                                                              (p["id"],))]}
+                           for p in people])
+
+
+@app.post("/api/feed/items/<int:iid>/reserve", provide_automatic_options=False)
+@feed_required
+def feed_reserve(iid):
+    feed_item(iid)
+    data = json_body()
+    if "by" not in data:
+        abort(400, "by is required: a name to reserve, or null to release.")
+    if data["by"] is not None:
+        who = feed_label(data)
+        # One statement, like reserve(): a shopper's reservation or a purchase landing at the same
+        # moment makes it match nothing. A feed reservation (no email) may be re-labelled.
+        cur = db().execute("UPDATE items SET reserved_by = ?, reserved_by_email = NULL, reserved_at = ? "
+                           "WHERE id = ? AND purchased = 0 AND archived_at IS NULL "
+                           "AND (reserved_by IS NULL OR reserved_by_email IS NULL)", (who, int(time.time()), iid))
+    else:
+        cur = db().execute("UPDATE items SET reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
+                           "WHERE id = ? AND archived_at IS NULL AND (reserved_by IS NULL OR reserved_by_email IS NULL)",
+                           (iid,))
+    db().commit()
+    now = feed_item(iid)
+    if cur.rowcount == 0:
+        if now["archived_at"]:
+            return feed_conflict("That gift has been archived.")
+        if now["purchased"]:
+            return feed_conflict(f"Already purchased by {now['purchased_by']}.")
+        return feed_conflict(f"Reserved by {now['reserved_by']}.")
+    if data["by"] is None and feed_drop_if_removed(iid):
+        return jsonify(deleted=True)
+    return jsonify(feed_item_json(now))
+
+
+@app.post("/api/feed/items/<int:iid>/purchase", provide_automatic_options=False)
+@feed_required
+def feed_purchase(iid):
+    feed_item(iid)
+    data = json_body()
+    purchased = data.get("purchased", True)
+    if not isinstance(purchased, bool):
+        abort(400, "purchased must be true or false.")
+    if purchased:
+        who = feed_label(data)
+        # Same claim as purchase(): buying ends a feed reservation; a shopper's reservation blocks it.
+        cur = db().execute("UPDATE items SET purchased = 1, purchased_by = ?, purchased_by_email = NULL, "
+                           "purchased_at = ?, reserved_by = NULL, reserved_by_email = NULL, reserved_at = NULL "
+                           "WHERE id = ? AND purchased = 0 AND archived_at IS NULL "
+                           "AND (reserved_by IS NULL OR reserved_by_email IS NULL)", (who, int(time.time()), iid))
+    else:
+        # Undo only the feed's own purchase; undoing something not purchased is harmless.
+        cur = db().execute("UPDATE items SET purchased = 0, purchased_by = NULL, purchased_by_email = NULL, "
+                           "purchased_at = NULL WHERE id = ? AND archived_at IS NULL "
+                           "AND (purchased = 0 OR purchased_by_email IS NULL)", (iid,))
+    db().commit()
+    now = feed_item(iid)
+    if cur.rowcount == 0:
+        if now["archived_at"]:
+            return feed_conflict("That gift has been archived.")
+        if now["purchased"]:
+            return feed_conflict(f"{'Already purchased' if purchased else 'Purchased'} by {now['purchased_by']}.")
+        return feed_conflict(f"Reserved by {now['reserved_by']}.")
+    if not purchased and feed_drop_if_removed(iid):
+        return jsonify(deleted=True)
+    return jsonify(feed_item_json(now))
 
 
 # ---------------------------------------------------------------- photos

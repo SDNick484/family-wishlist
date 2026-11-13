@@ -59,6 +59,12 @@ LAN_NAME="${LAN_NAME:-Home}"
 
 # Tabs created on the very first start only (manage them later in Settings).
 SEED_PEOPLE="${SEED_PEOPLE:-@@SEED_PEOPLE@@}"
+
+# Private feed for one companion service on the LAN (GET/POST /api/feed, Authorization: Bearer).
+# Empty token = no feed: every /api/feed route answers 404. Generate one with: openssl rand -hex 32
+FEED_TOKEN="${FEED_TOKEN:-@@FEED_TOKEN@@}"
+# Tab names the feed may read and reserve on, comma separated. Empty = none.
+FEED_PEOPLE="${FEED_PEOPLE:-@@FEED_PEOPLE@@}"
 EOF
   chmod 640 "$CONF"
 else
@@ -84,7 +90,8 @@ depend() { need net; after firewall; }
 start_pre() {
   # Family colors (fill tabs without a color; Settings overrides). Override in /etc/conf.d/wishlist.
   : ${PERSON_COLORS:="@@PERSON_COLORS@@"}
-  export DATA_DIR=/var/lib/wishlist ADMIN_EMAILS CF_TEAM_DOMAIN CF_AUD LAN_ROLE LAN_NAME SEED_PEOPLE PERSON_COLORS
+  export DATA_DIR=/var/lib/wishlist ADMIN_EMAILS CF_TEAM_DOMAIN CF_AUD LAN_ROLE LAN_NAME SEED_PEOPLE PERSON_COLORS \
+    FEED_TOKEN FEED_PEOPLE
   checkpath -f -o wishlist -m 0640 /var/log/wishlist.log
 }
 EOF

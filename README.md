@@ -66,6 +66,8 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
 | `LAN_NAME` | Name shown for LAN users (default `Home`) |
 | `SEED_PEOPLE` | Tabs created on the very first start |
 | `PERSON_COLORS` | Default tab colors, `Name=#hex,Other|Alias=#hex`; only fills tabs without a color |
+| `FEED_TOKEN` | Bearer token for the companion feed (`/api/feed`); empty turns the feed off (every feed route is a 404) |
+| `FEED_PEOPLE` | Comma list of tab names the feed exposes (matched case-insensitively); empty means none |
 
 ## How access works
 
@@ -82,7 +84,17 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
    what. Secret ideas need a Cloudflare sign-in; LAN visitors can't see or add them.
 5. Mutating requests need the `X-Wishlist: 1` header plus a JSON (or photo multipart) body and a same-origin
    `Origin`, which blocks cross-site request forgery.
-6. **Link previews** (`POST /api/preview`, editors only) are the one time the server fetches a URL it was
+6. **Companion feed** (`/api/feed`, off unless `FEED_TOKEN` is set) lets one trusted service on the LAN,
+   such as a private gift planner, read the tabs named in `FEED_PEOPLE` with their full reservation and
+   purchase state (secret ideas and owner-removed items included) and reserve, release or mark items
+   purchased on someone's behalf. It needs `Authorization: Bearer <FEED_TOKEN>` and a JSON body for writes,
+   but no `X-Wishlist` or `Origin`: the caller is a server. It has no role and no identity, and the token
+   unlocks nothing else. A request with any Cloudflare header or Access cookie, from a non-private address,
+   or with a missing or wrong token answers exactly like a route that doesn't exist, so the feed is never
+   reachable through the tunnel. The feed's reservations and purchases are stored without an email; it can
+   release or undo only those, and a shopper's answers 409 (`Reserved by <name>.`). The token is a password
+   to everything spoiler protection hides: keep it in `/etc/conf.d/wishlist` and the companion's config only.
+7. **Link previews** (`POST /api/preview`, editors only) are the one time the server fetches a URL it was
    given. It only speaks http(s), refuses hosts that resolve to private, loopback, link-local or other
    non-public addresses (re-checked on each of at most 3 redirects, and the connection goes to the address
    that was checked), and gives up after 5 seconds, 1 MB of page or 20 MB of image. The photo is
