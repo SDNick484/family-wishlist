@@ -92,8 +92,14 @@ Logs: `tail -f /var/log/wishlist.log` · Restart: `rc-service wishlist restart`
    unlocks nothing else. A request with any Cloudflare header or Access cookie, from a non-private address,
    or with a missing or wrong token answers exactly like a route that doesn't exist, so the feed is never
    reachable through the tunnel. The feed's reservations and purchases are stored without an email; it can
-   release or undo only those, and a shopper's answers 409 (`Reserved by <name>.`). The token is a password
-   to everything spoiler protection hides: keep it in `/etc/conf.d/wishlist` and the companion's config only.
+   release or undo only those (and a LAN visitor's, which have no email either), and a signed-in shopper's
+   answers 409 (`Reserved by <name>.`). An archived gift, an item on another tab and an unknown id all
+   answer 404 `No such item.`. Releasing or undoing through the feed never deletes an item the owner
+   removed: the companion re-labels by undoing and claiming again. Until it is claimed again, such an item
+   is hidden from everyone and left out of the feed, as if deleted. The contract is
+   [gift-tracker `docs/wishlist-feed.md`](https://github.com/SDNick484/gift-tracker/blob/main/docs/wishlist-feed.md).
+   The token is a password to everything spoiler protection hides: keep it in `/etc/conf.d/wishlist` and
+   the companion's config only.
 7. **Link previews** (`POST /api/preview`, editors only) are the one time the server fetches a URL it was
    given. It only speaks http(s), refuses hosts that resolve to private, loopback, link-local or other
    non-public addresses (re-checked on each of at most 3 redirects, and the connection goes to the address
